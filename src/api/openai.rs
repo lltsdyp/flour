@@ -76,7 +76,10 @@ impl ChatCompletionResponse {
             model,
             choices: vec![Choice {
                 index: 0,
-                message: ChatMessage { role: "assistant".into(), content },
+                message: ChatMessage {
+                    role: "assistant".into(),
+                    content,
+                },
                 finish_reason: "stop".into(),
             }],
             usage: Usage {
@@ -121,7 +124,10 @@ impl ChatCompletionChunk {
             model: model.to_string(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: StreamDelta { role: Some("assistant".into()), content: None },
+                delta: StreamDelta {
+                    role: Some("assistant".into()),
+                    content: None,
+                },
                 finish_reason: None,
             }],
         }
@@ -135,7 +141,10 @@ impl ChatCompletionChunk {
             model: model.to_string(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: StreamDelta { role: None, content: Some(content.to_string()) },
+                delta: StreamDelta {
+                    role: None,
+                    content: Some(content.to_string()),
+                },
                 finish_reason: None,
             }],
         }
@@ -172,8 +181,8 @@ pub struct ModelsListResponse {
 
 #[cfg(test)]
 mod tests {
-    use crate::engine::GenerationStats;
     use super::*;
+    use crate::engine::GenerationStats;
 
     #[test]
     fn request_deserializes_with_only_required_fields() {
@@ -199,7 +208,10 @@ mod tests {
 
     #[test]
     fn response_serializes_with_expected_shape() {
-        let stats = GenerationStats { prompt_tokens: 3, completion_tokens: 2 };
+        let stats = GenerationStats {
+            prompt_tokens: 3,
+            completion_tokens: 2,
+        };
         let resp = ChatCompletionResponse::new("flour".into(), "hello".into(), &stats);
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["object"], "chat.completion");
@@ -227,7 +239,12 @@ mod tests {
     fn models_list_response_serializes() {
         let resp = ModelsListResponse {
             object: "list".into(),
-            data: vec![ModelObject { id: "flour".into(), object: "model".into(), created: 0, owned_by: "flour".into() }],
+            data: vec![ModelObject {
+                id: "flour".into(),
+                object: "model".into(),
+                created: 0,
+                owned_by: "flour".into(),
+            }],
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["data"][0]["id"], "flour");

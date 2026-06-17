@@ -54,7 +54,9 @@ pub async fn chat_completions(
             yield Ok(Event::default().data("[DONE]"));
         };
 
-        Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
+        Ok(Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response())
     } else {
         let engine = state.engine.clone();
         let (text, stats) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -85,7 +87,10 @@ mod tests {
         let engine = Engine::load(dir.path()).unwrap();
         // Keep the tempdir alive for the engine's lifetime by leaking it — fine in tests.
         std::mem::forget(dir);
-        AppState { engine: Arc::new(Mutex::new(engine)), started_at: 0 }
+        AppState {
+            engine: Arc::new(Mutex::new(engine)),
+            started_at: 0,
+        }
     }
 
     fn request(stream: bool) -> ChatCompletionRequest {
@@ -102,15 +107,24 @@ mod tests {
     #[tokio::test]
     async fn blocking_request_returns_chat_completion_json() {
         let state = make_state();
-        let resp = chat_completions(State(state), Json(request(false))).await.unwrap();
+        let resp = chat_completions(State(state), Json(request(false)))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 
     #[tokio::test]
     async fn streaming_request_returns_event_stream_content_type() {
         let state = make_state();
-        let resp = chat_completions(State(state), Json(request(true))).await.unwrap();
-        let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let resp = chat_completions(State(state), Json(request(true)))
+            .await
+            .unwrap();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(content_type.starts_with("text/event-stream"));
     }
 }

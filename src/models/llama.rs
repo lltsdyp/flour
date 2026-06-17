@@ -83,7 +83,10 @@ mod tests {
         assert!(!cfg.use_qk_norm);
         assert!(!cfg.tie_word_embeddings);
         assert_eq!(cfg.max_seq_len, 8192);
-        assert!(matches!(cfg.eos_token_id, Some(crate::models::common::EosTokenId::Single(128001))));
+        assert!(matches!(
+            cfg.eos_token_id,
+            Some(crate::models::common::EosTokenId::Single(128001))
+        ));
     }
 
     #[test]

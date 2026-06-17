@@ -32,7 +32,9 @@ pub struct LogitsSampler {
 
 impl LogitsSampler {
     pub fn new(seed: u64) -> Self {
-        Self { rng: StdRng::seed_from_u64(seed) }
+        Self {
+            rng: StdRng::seed_from_u64(seed),
+        }
     }
 
     pub fn sample(&mut self, logits: &[f32], params: &SamplingParams) -> u32 {
@@ -40,7 +42,10 @@ impl LogitsSampler {
             return arg_max(logits);
         }
 
-        let scaled: Vec<f32> = logits.iter().map(|&l| l / params.temperature as f32).collect();
+        let scaled: Vec<f32> = logits
+            .iter()
+            .map(|&l| l / params.temperature as f32)
+            .collect();
         let mut probs = softmax(&scaled);
 
         let mut indices: Vec<usize> = (0..probs.len()).collect();

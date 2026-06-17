@@ -32,7 +32,9 @@ pub struct Qwen3Config {
 impl Qwen3Config {
     pub fn into_config(self) -> Config {
         let num_key_value_heads = self.num_key_value_heads.unwrap_or(self.num_attention_heads);
-        let head_dim = self.head_dim.unwrap_or(self.hidden_size / self.num_attention_heads);
+        let head_dim = self
+            .head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads);
         Config {
             hidden_size: self.hidden_size,
             intermediate_size: self.intermediate_size,

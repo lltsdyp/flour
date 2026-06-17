@@ -36,7 +36,8 @@ pub fn causal_attention(
         }
         None => att,
     };
-    let att = candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?.to_dtype(att.dtype())?;
+    let att =
+        candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?.to_dtype(att.dtype())?;
     att.matmul(&v.contiguous()?)
 }
 
@@ -47,14 +48,20 @@ mod tests {
 
     #[test]
     fn repeat_kv_is_noop_for_n_rep_1() {
-        let x = Tensor::arange(0f32, 24f32, &Device::Cpu).unwrap().reshape((1, 2, 3, 4)).unwrap();
+        let x = Tensor::arange(0f32, 24f32, &Device::Cpu)
+            .unwrap()
+            .reshape((1, 2, 3, 4))
+            .unwrap();
         let y = repeat_kv(x.clone(), 1).unwrap();
         assert_eq!(y.dims(), x.dims());
     }
 
     #[test]
     fn repeat_kv_expands_heads() {
-        let x = Tensor::arange(0f32, 24f32, &Device::Cpu).unwrap().reshape((1, 2, 3, 4)).unwrap();
+        let x = Tensor::arange(0f32, 24f32, &Device::Cpu)
+            .unwrap()
+            .reshape((1, 2, 3, 4))
+            .unwrap();
         let y = repeat_kv(x, 3).unwrap();
         assert_eq!(y.dims(), &[1, 6, 3, 4]);
     }

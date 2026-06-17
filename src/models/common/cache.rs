@@ -63,7 +63,12 @@ impl Cache {
         Ok(self.masks.get(&key).unwrap().clone())
     }
 
-    pub fn append_kv(&mut self, layer_idx: usize, k: Tensor, v: Tensor) -> Result<(Tensor, Tensor)> {
+    pub fn append_kv(
+        &mut self,
+        layer_idx: usize,
+        k: Tensor,
+        v: Tensor,
+    ) -> Result<(Tensor, Tensor)> {
         let (mut k, mut v) = (k, v);
         if let Some((cache_k, cache_v)) = &self.kvs[layer_idx] {
             k = Tensor::cat(&[cache_k, &k], 2)?;
@@ -115,8 +120,20 @@ mod tests {
     #[test]
     fn rope_tables_respect_index_pos_offset() {
         let cache = Cache::new(&test_config(), &Device::Cpu).unwrap();
-        let cos_a = cache.rope_cos(0, 1).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let cos_b = cache.rope_cos(3, 1).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let cos_a = cache
+            .rope_cos(0, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let cos_b = cache
+            .rope_cos(3, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         assert_ne!(cos_a, cos_b);
     }
 
@@ -141,12 +158,14 @@ mod tests {
     #[test]
     fn append_kv_concatenates_along_seq_dim() {
         let mut cache = Cache::new(&test_config(), &Device::Cpu).unwrap();
-        let k1 = candle_core::Tensor::zeros((1, 2, 2, 4), candle_core::DType::F32, &Device::Cpu).unwrap();
+        let k1 = candle_core::Tensor::zeros((1, 2, 2, 4), candle_core::DType::F32, &Device::Cpu)
+            .unwrap();
         let v1 = k1.clone();
         let (k, _v) = cache.append_kv(0, k1, v1).unwrap();
         assert_eq!(k.dims(), &[1, 2, 2, 4]);
 
-        let k2 = candle_core::Tensor::zeros((1, 2, 1, 4), candle_core::DType::F32, &Device::Cpu).unwrap();
+        let k2 = candle_core::Tensor::zeros((1, 2, 1, 4), candle_core::DType::F32, &Device::Cpu)
+            .unwrap();
         let v2 = k2.clone();
         let (k, _v) = cache.append_kv(0, k2, v2).unwrap();
         assert_eq!(k.dims(), &[1, 2, 3, 4]); // 2 + 1 = 3

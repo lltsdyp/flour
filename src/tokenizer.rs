@@ -41,7 +41,10 @@ impl ChatTemplate {
             ChatTemplate::ChatMl => {
                 let mut out = String::new();
                 for m in messages {
-                    out.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", m.role, m.content));
+                    out.push_str(&format!(
+                        "<|im_start|>{}\n{}<|im_end|>\n",
+                        m.role, m.content
+                    ));
                 }
                 out.push_str("<|im_start|>assistant\n");
                 out
@@ -87,8 +90,14 @@ mod tests {
 
     fn msgs() -> Vec<ChatMessage> {
         vec![
-            ChatMessage { role: "system".into(), content: "You are helpful.".into() },
-            ChatMessage { role: "user".into(), content: "Hi".into() },
+            ChatMessage {
+                role: "system".into(),
+                content: "You are helpful.".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+            },
         ]
     }
 
@@ -96,7 +105,8 @@ mod tests {
     fn llama_template_wraps_each_turn_and_opens_assistant_turn() {
         let out = ChatTemplate::Llama3.render(&msgs());
         assert!(out.starts_with("<|begin_of_text|>"));
-        assert!(out.contains("<|start_header_id|>system<|end_header_id|>\n\nYou are helpful.<|eot_id|>"));
+        assert!(out
+            .contains("<|start_header_id|>system<|end_header_id|>\n\nYou are helpful.<|eot_id|>"));
         assert!(out.contains("<|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>"));
         assert!(out.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
     }
@@ -111,8 +121,17 @@ mod tests {
 
     #[test]
     fn for_family_picks_llama3_for_llama_and_chatml_for_qwen() {
-        assert!(matches!(ChatTemplate::for_family(ModelFamily::Llama), ChatTemplate::Llama3));
-        assert!(matches!(ChatTemplate::for_family(ModelFamily::Qwen2), ChatTemplate::ChatMl));
-        assert!(matches!(ChatTemplate::for_family(ModelFamily::Qwen3), ChatTemplate::ChatMl));
+        assert!(matches!(
+            ChatTemplate::for_family(ModelFamily::Llama),
+            ChatTemplate::Llama3
+        ));
+        assert!(matches!(
+            ChatTemplate::for_family(ModelFamily::Qwen2),
+            ChatTemplate::ChatMl
+        ));
+        assert!(matches!(
+            ChatTemplate::for_family(ModelFamily::Qwen3),
+            ChatTemplate::ChatMl
+        ));
     }
 }

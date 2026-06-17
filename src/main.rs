@@ -7,7 +7,10 @@ use flour::api::{serve, AppState};
 use flour::engine::Engine;
 
 #[derive(Parser, Debug)]
-#[command(name = "flour", about = "Minimal CPU-only OpenAI-compatible inference server")]
+#[command(
+    name = "flour",
+    about = "Minimal CPU-only OpenAI-compatible inference server"
+)]
 struct Args {
     /// Directory containing config.json, tokenizer.json, and safetensors weights.
     #[arg(long)]
@@ -35,7 +38,10 @@ async fn main() -> anyhow::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let state = AppState { engine: Arc::new(Mutex::new(engine)), started_at };
+    let state = AppState {
+        engine: Arc::new(Mutex::new(engine)),
+        started_at,
+    };
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     serve(state, addr).await

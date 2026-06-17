@@ -31,10 +31,21 @@ impl CausalLM {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
 
-        Ok(Self { embed_tokens, layers, norm, lm_head, cfg })
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            cfg,
+        })
     }
 
-    pub fn forward(&self, input_ids: &Tensor, index_pos: usize, cache: &mut Cache) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        input_ids: &Tensor,
+        index_pos: usize,
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
         let mut x = self.embed_tokens.forward(input_ids)?;
         for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward(&x, index_pos, i, cache)?;
@@ -90,19 +101,52 @@ mod tests {
         let size_q = cfg.head_dim * cfg.num_attention_heads;
         let size_kv = cfg.head_dim * cfg.num_key_value_heads;
         let mut map: HashMap<String, Tensor> = HashMap::new();
-        map.insert("model.embed_tokens.weight".into(), make_tensor(&[cfg.vocab_size, h], 1));
-        map.insert("model.norm.weight".into(), Tensor::ones(h, DType::F32, &Device::Cpu).unwrap());
+        map.insert(
+            "model.embed_tokens.weight".into(),
+            make_tensor(&[cfg.vocab_size, h], 1),
+        );
+        map.insert(
+            "model.norm.weight".into(),
+            Tensor::ones(h, DType::F32, &Device::Cpu).unwrap(),
+        );
         for layer in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{layer}");
-            map.insert(format!("{p}.input_layernorm.weight"), Tensor::ones(h, DType::F32, &Device::Cpu).unwrap());
-            map.insert(format!("{p}.post_attention_layernorm.weight"), Tensor::ones(h, DType::F32, &Device::Cpu).unwrap());
-            map.insert(format!("{p}.self_attn.q_proj.weight"), make_tensor(&[size_q, h], 10 + layer as u64));
-            map.insert(format!("{p}.self_attn.k_proj.weight"), make_tensor(&[size_kv, h], 20 + layer as u64));
-            map.insert(format!("{p}.self_attn.v_proj.weight"), make_tensor(&[size_kv, h], 30 + layer as u64));
-            map.insert(format!("{p}.self_attn.o_proj.weight"), make_tensor(&[h, size_q], 40 + layer as u64));
-            map.insert(format!("{p}.mlp.gate_proj.weight"), make_tensor(&[i, h], 50 + layer as u64));
-            map.insert(format!("{p}.mlp.up_proj.weight"), make_tensor(&[i, h], 60 + layer as u64));
-            map.insert(format!("{p}.mlp.down_proj.weight"), make_tensor(&[h, i], 70 + layer as u64));
+            map.insert(
+                format!("{p}.input_layernorm.weight"),
+                Tensor::ones(h, DType::F32, &Device::Cpu).unwrap(),
+            );
+            map.insert(
+                format!("{p}.post_attention_layernorm.weight"),
+                Tensor::ones(h, DType::F32, &Device::Cpu).unwrap(),
+            );
+            map.insert(
+                format!("{p}.self_attn.q_proj.weight"),
+                make_tensor(&[size_q, h], 10 + layer as u64),
+            );
+            map.insert(
+                format!("{p}.self_attn.k_proj.weight"),
+                make_tensor(&[size_kv, h], 20 + layer as u64),
+            );
+            map.insert(
+                format!("{p}.self_attn.v_proj.weight"),
+                make_tensor(&[size_kv, h], 30 + layer as u64),
+            );
+            map.insert(
+                format!("{p}.self_attn.o_proj.weight"),
+                make_tensor(&[h, size_q], 40 + layer as u64),
+            );
+            map.insert(
+                format!("{p}.mlp.gate_proj.weight"),
+                make_tensor(&[i, h], 50 + layer as u64),
+            );
+            map.insert(
+                format!("{p}.mlp.up_proj.weight"),
+                make_tensor(&[i, h], 60 + layer as u64),
+            );
+            map.insert(
+                format!("{p}.mlp.down_proj.weight"),
+                make_tensor(&[h, i], 70 + layer as u64),
+            );
         }
         VarBuilder::from_tensors(map, DType::F32, &Device::Cpu)
     }

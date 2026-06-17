@@ -4,7 +4,11 @@ use anyhow::{anyhow, Context};
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 
-pub fn load_var_builder(model_dir: &Path, dtype: DType, device: &Device) -> anyhow::Result<VarBuilder<'static>> {
+pub fn load_var_builder(
+    model_dir: &Path,
+    dtype: DType,
+    device: &Device,
+) -> anyhow::Result<VarBuilder<'static>> {
     let files = collect_safetensors_files(model_dir)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device) }
         .context("failed to mmap safetensors weights")?;
@@ -51,7 +55,10 @@ mod tests {
     fn loads_single_safetensors_file() {
         let dir = tempfile::tempdir().unwrap();
         let mut tensors = HashMap::new();
-        tensors.insert("weight".to_string(), Tensor::ones((2, 2), DType::F32, &Device::Cpu).unwrap());
+        tensors.insert(
+            "weight".to_string(),
+            Tensor::ones((2, 2), DType::F32, &Device::Cpu).unwrap(),
+        );
         candle_core::safetensors::save(&tensors, dir.path().join("model.safetensors")).unwrap();
 
         let vb = load_var_builder(dir.path(), DType::F32, &Device::Cpu).unwrap();
@@ -64,12 +71,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let mut shard0 = HashMap::new();
-        shard0.insert("a".to_string(), Tensor::ones((1,), DType::F32, &Device::Cpu).unwrap());
-        candle_core::safetensors::save(&shard0, dir.path().join("model-00001-of-00002.safetensors")).unwrap();
+        shard0.insert(
+            "a".to_string(),
+            Tensor::ones((1,), DType::F32, &Device::Cpu).unwrap(),
+        );
+        candle_core::safetensors::save(
+            &shard0,
+            dir.path().join("model-00001-of-00002.safetensors"),
+        )
+        .unwrap();
 
         let mut shard1 = HashMap::new();
-        shard1.insert("b".to_string(), Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap());
-        candle_core::safetensors::save(&shard1, dir.path().join("model-00002-of-00002.safetensors")).unwrap();
+        shard1.insert(
+            "b".to_string(),
+            Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap(),
+        );
+        candle_core::safetensors::save(
+            &shard1,
+            dir.path().join("model-00002-of-00002.safetensors"),
+        )
+        .unwrap();
 
         let index = serde_json::json!({
             "weight_map": {

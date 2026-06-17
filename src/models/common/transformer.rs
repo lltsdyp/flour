@@ -14,7 +14,9 @@ pub struct DecoderLayer {
 impl DecoderLayer {
     pub fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let input_w = vb.pp("input_layernorm").get(cfg.hidden_size, "weight")?;
-        let post_w = vb.pp("post_attention_layernorm").get(cfg.hidden_size, "weight")?;
+        let post_w = vb
+            .pp("post_attention_layernorm")
+            .get(cfg.hidden_size, "weight")?;
         Ok(Self {
             input_layernorm: RmsNorm::new(input_w, cfg.rms_norm_eps),
             post_attention_layernorm: RmsNorm::new(post_w, cfg.rms_norm_eps),
@@ -84,12 +86,30 @@ mod tests {
         let size_q = cfg.head_dim * cfg.num_attention_heads;
         let size_kv = cfg.head_dim * cfg.num_key_value_heads;
         let mut map: HashMap<String, Tensor> = HashMap::new();
-        map.insert("input_layernorm.weight".into(), Tensor::ones(h, DType::F32, &Device::Cpu).unwrap());
-        map.insert("post_attention_layernorm.weight".into(), Tensor::ones(h, DType::F32, &Device::Cpu).unwrap());
-        map.insert("self_attn.q_proj.weight".into(), make_tensor(&[size_q, h], 30));
-        map.insert("self_attn.k_proj.weight".into(), make_tensor(&[size_kv, h], 31));
-        map.insert("self_attn.v_proj.weight".into(), make_tensor(&[size_kv, h], 32));
-        map.insert("self_attn.o_proj.weight".into(), make_tensor(&[h, size_q], 33));
+        map.insert(
+            "input_layernorm.weight".into(),
+            Tensor::ones(h, DType::F32, &Device::Cpu).unwrap(),
+        );
+        map.insert(
+            "post_attention_layernorm.weight".into(),
+            Tensor::ones(h, DType::F32, &Device::Cpu).unwrap(),
+        );
+        map.insert(
+            "self_attn.q_proj.weight".into(),
+            make_tensor(&[size_q, h], 30),
+        );
+        map.insert(
+            "self_attn.k_proj.weight".into(),
+            make_tensor(&[size_kv, h], 31),
+        );
+        map.insert(
+            "self_attn.v_proj.weight".into(),
+            make_tensor(&[size_kv, h], 32),
+        );
+        map.insert(
+            "self_attn.o_proj.weight".into(),
+            make_tensor(&[h, size_q], 33),
+        );
         map.insert("mlp.gate_proj.weight".into(), make_tensor(&[i, h], 40));
         map.insert("mlp.up_proj.weight".into(), make_tensor(&[i, h], 41));
         map.insert("mlp.down_proj.weight".into(), make_tensor(&[h, i], 42));

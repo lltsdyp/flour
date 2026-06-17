@@ -4,7 +4,10 @@ use anyhow::Context;
 use candle_core::{DType, Device, IndexOp, Tensor};
 
 use crate::loader::safetensors::load_var_builder;
-use crate::models::{self, common::{CausalLM, Cache, EosTokenId}};
+use crate::models::{
+    self,
+    common::{Cache, CausalLM, EosTokenId},
+};
 use crate::sampling::{apply_repeat_penalty, LogitsSampler, SamplingParams};
 use crate::tokenizer::{ChatMessage, ChatTemplate, Tokenizer};
 
@@ -52,7 +55,14 @@ impl Engine {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "model".to_string());
 
-        Ok(Self { model, tokenizer, chat_template, eos_token_id, device, model_id })
+        Ok(Self {
+            model,
+            tokenizer,
+            chat_template,
+            eos_token_id,
+            device,
+            model_id,
+        })
     }
 
     pub fn model_id(&self) -> &str {
@@ -75,10 +85,9 @@ impl Engine {
 
         let input = Tensor::new(prompt_tokens.as_slice(), &self.device)?.unsqueeze(0)?;
         let mut logits = self.model.forward(&input, 0, &mut cache)?;
-        let mut index_pos = prompt_len;
         let mut completion_tokens = 0usize;
 
-        for _ in 0..params.max_tokens {
+        for index_pos in (prompt_len..).take(params.max_tokens) {
             let seq_len = logits.dim(1)?;
             let last = logits.i((0, seq_len - 1))?.to_dtype(DType::F32)?;
             let mut logits_vec = last.to_vec1::<f32>()?;
@@ -100,10 +109,12 @@ impl Engine {
 
             let next_input = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
             logits = self.model.forward(&next_input, index_pos, &mut cache)?;
-            index_pos += 1;
         }
 
-        Ok(GenerationStats { prompt_tokens: prompt_len, completion_tokens })
+        Ok(GenerationStats {
+            prompt_tokens: prompt_len,
+            completion_tokens,
+        })
     }
 }
 
@@ -148,7 +159,11 @@ pub(crate) mod tests {
             "tie_word_embeddings": true,
             "max_position_embeddings": 64
         });
-        std::fs::write(dir.join("config.json"), serde_json::to_string(&config).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_string(&config).unwrap(),
+        )
+        .unwrap();
 
         fn rand_tensor(shape: &[usize], seed: u64) -> Tensor {
             use rand::rngs::StdRng;
@@ -162,21 +177,60 @@ pub(crate) mod tests {
         let size_q = head_dim * heads;
         let size_kv = head_dim * kv_heads;
         let mut tensors: HashMap<String, Tensor> = HashMap::new();
-        tensors.insert("model.embed_tokens.weight".into(), rand_tensor(&[vocab, hidden], 1));
-        tensors.insert("model.norm.weight".into(), Tensor::ones(hidden, DType::F32, &Device::Cpu).unwrap());
+        tensors.insert(
+            "model.embed_tokens.weight".into(),
+            rand_tensor(&[vocab, hidden], 1),
+        );
+        tensors.insert(
+            "model.norm.weight".into(),
+            Tensor::ones(hidden, DType::F32, &Device::Cpu).unwrap(),
+        );
         for l in 0..layers {
             let p = format!("model.layers.{l}");
-            tensors.insert(format!("{p}.input_layernorm.weight"), Tensor::ones(hidden, DType::F32, &Device::Cpu).unwrap());
-            tensors.insert(format!("{p}.post_attention_layernorm.weight"), Tensor::ones(hidden, DType::F32, &Device::Cpu).unwrap());
-            tensors.insert(format!("{p}.self_attn.q_proj.weight"), rand_tensor(&[size_q, hidden], 10));
-            tensors.insert(format!("{p}.self_attn.k_proj.weight"), rand_tensor(&[size_kv, hidden], 11));
-            tensors.insert(format!("{p}.self_attn.v_proj.weight"), rand_tensor(&[size_kv, hidden], 12));
-            tensors.insert(format!("{p}.self_attn.o_proj.weight"), rand_tensor(&[hidden, size_q], 13));
-            tensors.insert(format!("{p}.self_attn.q_norm.weight"), Tensor::ones(head_dim, DType::F32, &Device::Cpu).unwrap());
-            tensors.insert(format!("{p}.self_attn.k_norm.weight"), Tensor::ones(head_dim, DType::F32, &Device::Cpu).unwrap());
-            tensors.insert(format!("{p}.mlp.gate_proj.weight"), rand_tensor(&[intermediate, hidden], 14));
-            tensors.insert(format!("{p}.mlp.up_proj.weight"), rand_tensor(&[intermediate, hidden], 15));
-            tensors.insert(format!("{p}.mlp.down_proj.weight"), rand_tensor(&[hidden, intermediate], 16));
+            tensors.insert(
+                format!("{p}.input_layernorm.weight"),
+                Tensor::ones(hidden, DType::F32, &Device::Cpu).unwrap(),
+            );
+            tensors.insert(
+                format!("{p}.post_attention_layernorm.weight"),
+                Tensor::ones(hidden, DType::F32, &Device::Cpu).unwrap(),
+            );
+            tensors.insert(
+                format!("{p}.self_attn.q_proj.weight"),
+                rand_tensor(&[size_q, hidden], 10),
+            );
+            tensors.insert(
+                format!("{p}.self_attn.k_proj.weight"),
+                rand_tensor(&[size_kv, hidden], 11),
+            );
+            tensors.insert(
+                format!("{p}.self_attn.v_proj.weight"),
+                rand_tensor(&[size_kv, hidden], 12),
+            );
+            tensors.insert(
+                format!("{p}.self_attn.o_proj.weight"),
+                rand_tensor(&[hidden, size_q], 13),
+            );
+            tensors.insert(
+                format!("{p}.self_attn.q_norm.weight"),
+                Tensor::ones(head_dim, DType::F32, &Device::Cpu).unwrap(),
+            );
+            tensors.insert(
+                format!("{p}.self_attn.k_norm.weight"),
+                Tensor::ones(head_dim, DType::F32, &Device::Cpu).unwrap(),
+            );
+            tensors.insert(
+                format!("{p}.mlp.gate_proj.weight"),
+                rand_tensor(&[intermediate, hidden], 14),
+            );
+            tensors.insert(
+                format!("{p}.mlp.up_proj.weight"),
+                rand_tensor(&[intermediate, hidden], 15),
+            );
+            tensors.insert(
+                format!("{p}.mlp.down_proj.weight"),
+                rand_tensor(&[hidden, intermediate], 16),
+            );
         }
         candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
 
@@ -200,7 +254,10 @@ pub(crate) mod tests {
                     n += 1;
                 }
             }
-            bs.into_iter().zip(cs).map(|(b, c)| (b, char::from_u32(c).unwrap())).collect()
+            bs.into_iter()
+                .zip(cs)
+                .map(|(b, c)| (b, char::from_u32(c).unwrap()))
+                .collect()
         }
         let byte_map = bytes_to_unicode();
         let mut vocab_map = serde_json::Map::new();
@@ -229,7 +286,11 @@ pub(crate) mod tests {
                 "merges": []
             }
         });
-        std::fs::write(dir.join("tokenizer.json"), serde_json::to_string(&tokenizer_json).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("tokenizer.json"),
+            serde_json::to_string(&tokenizer_json).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -238,13 +299,25 @@ pub(crate) mod tests {
         write_fixture_model(dir.path());
 
         let engine = Engine::load(dir.path()).unwrap();
-        assert_eq!(engine.model_id(), dir.path().file_name().unwrap().to_string_lossy());
+        assert_eq!(
+            engine.model_id(),
+            dir.path().file_name().unwrap().to_string_lossy()
+        );
 
-        let messages = vec![ChatMessage { role: "user".into(), content: "hi".into() }];
-        let params = crate::sampling::SamplingParams { max_tokens: 4, seed: 1, ..Default::default() };
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let params = crate::sampling::SamplingParams {
+            max_tokens: 4,
+            seed: 1,
+            ..Default::default()
+        };
 
         let mut produced = String::new();
-        let stats = engine.generate(&messages, &params, |tok| produced.push_str(tok)).unwrap();
+        let stats = engine
+            .generate(&messages, &params, |tok| produced.push_str(tok))
+            .unwrap();
 
         assert!(stats.prompt_tokens > 0);
         assert!(stats.completion_tokens <= 4);
@@ -255,13 +328,25 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture_model(dir.path());
         let engine = Engine::load(dir.path()).unwrap();
-        let messages = vec![ChatMessage { role: "user".into(), content: "hi".into() }];
-        let params = crate::sampling::SamplingParams { max_tokens: 4, seed: 99, temperature: 0.0, ..Default::default() };
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let params = crate::sampling::SamplingParams {
+            max_tokens: 4,
+            seed: 99,
+            temperature: 0.0,
+            ..Default::default()
+        };
 
         let mut a = String::new();
-        engine.generate(&messages, &params, |tok| a.push_str(tok)).unwrap();
+        engine
+            .generate(&messages, &params, |tok| a.push_str(tok))
+            .unwrap();
         let mut b = String::new();
-        engine.generate(&messages, &params, |tok| b.push_str(tok)).unwrap();
+        engine
+            .generate(&messages, &params, |tok| b.push_str(tok))
+            .unwrap();
         assert_eq!(a, b);
     }
 }

@@ -51,25 +51,29 @@ mod tests {
 
     #[test]
     fn detects_llama_from_architectures() {
-        let raw: serde_json::Value = serde_json::from_str(r#"{"architectures":["LlamaForCausalLM"]}"#).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(r#"{"architectures":["LlamaForCausalLM"]}"#).unwrap();
         assert_eq!(detect_family(&raw).unwrap(), ModelFamily::Llama);
     }
 
     #[test]
     fn detects_qwen2_from_architectures() {
-        let raw: serde_json::Value = serde_json::from_str(r#"{"architectures":["Qwen2ForCausalLM"]}"#).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(r#"{"architectures":["Qwen2ForCausalLM"]}"#).unwrap();
         assert_eq!(detect_family(&raw).unwrap(), ModelFamily::Qwen2);
     }
 
     #[test]
     fn detects_qwen3_from_architectures() {
-        let raw: serde_json::Value = serde_json::from_str(r#"{"architectures":["Qwen3ForCausalLM"]}"#).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(r#"{"architectures":["Qwen3ForCausalLM"]}"#).unwrap();
         assert_eq!(detect_family(&raw).unwrap(), ModelFamily::Qwen3);
     }
 
     #[test]
     fn rejects_unsupported_architecture() {
-        let raw: serde_json::Value = serde_json::from_str(r#"{"architectures":["MixtralForCausalLM"]}"#).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(r#"{"architectures":["MixtralForCausalLM"]}"#).unwrap();
         assert!(detect_family(&raw).is_err());
     }
 

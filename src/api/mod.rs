@@ -40,7 +40,10 @@ mod tests {
         let dir = crate::engine::tests::fixture_dir_for_external_use();
         let engine = Engine::load(dir.path()).unwrap();
         std::mem::forget(dir);
-        let state = AppState { engine: Arc::new(Mutex::new(engine)), started_at: 0 };
+        let state = AppState {
+            engine: Arc::new(Mutex::new(engine)),
+            started_at: 0,
+        };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -54,7 +57,9 @@ mod tests {
     #[tokio::test]
     async fn models_endpoint_returns_loaded_model_over_real_http() {
         let addr = spawn_test_server().await;
-        let resp = reqwest::get(format!("http://{addr}/v1/models")).await.unwrap();
+        let resp = reqwest::get(format!("http://{addr}/v1/models"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         let json: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(json["object"], "list");

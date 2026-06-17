@@ -34,7 +34,10 @@ mod tests {
         let dir = fixture_engine_dir();
         let engine = Engine::load(dir.path()).unwrap();
         let expected_id = engine.model_id().to_string();
-        let state = AppState { engine: Arc::new(Mutex::new(engine)), started_at: 0 };
+        let state = AppState {
+            engine: Arc::new(Mutex::new(engine)),
+            started_at: 0,
+        };
 
         let Json(resp) = list_models(State(state)).await;
         assert_eq!(resp.object, "list");

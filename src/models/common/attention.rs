@@ -113,7 +113,11 @@ impl CausalSelfAttention {
             causal_attention(&q, &k, &v, None, scale)?
         };
 
-        let y = y.transpose(1, 2)?.reshape((b_sz, seq_len, self.num_attention_heads * self.head_dim))?;
+        let y = y.transpose(1, 2)?.reshape((
+            b_sz,
+            seq_len,
+            self.num_attention_heads * self.head_dim,
+        ))?;
         self.o_proj.forward(&y)
     }
 }
@@ -169,8 +173,14 @@ mod tests {
             map.insert("v_proj.bias".into(), make_tensor(&[size_kv], 7));
         }
         if cfg.use_qk_norm {
-            map.insert("q_norm.weight".into(), Tensor::ones(cfg.head_dim, DType::F32, &Device::Cpu).unwrap());
-            map.insert("k_norm.weight".into(), Tensor::ones(cfg.head_dim, DType::F32, &Device::Cpu).unwrap());
+            map.insert(
+                "q_norm.weight".into(),
+                Tensor::ones(cfg.head_dim, DType::F32, &Device::Cpu).unwrap(),
+            );
+            map.insert(
+                "k_norm.weight".into(),
+                Tensor::ones(cfg.head_dim, DType::F32, &Device::Cpu).unwrap(),
+            );
         }
         VarBuilder::from_tensors(map, DType::F32, &Device::Cpu)
     }
