@@ -1,3 +1,4 @@
+pub mod api;
 pub mod backend;
 pub mod engine;
 pub mod loader;
