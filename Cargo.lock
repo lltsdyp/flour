@@ -627,6 +627,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "clap",
+ "http-body-util",
  "rand 0.8.6",
  "reqwest",
  "serde",
