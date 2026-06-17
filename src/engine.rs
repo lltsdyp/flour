@@ -108,11 +108,17 @@ impl Engine {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::tokenizer::ChatMessage;
     use candle_core::{DType, Device, Tensor};
     use std::collections::HashMap;
+
+    pub(crate) fn fixture_dir_for_external_use() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture_model(dir.path());
+        dir
+    }
 
     /// Builds a tiny but structurally valid Qwen3-family model directory: config.json,
     /// a minimal tokenizer.json (byte-level BPE over a handful of fixed tokens), and
