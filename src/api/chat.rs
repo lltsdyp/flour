@@ -29,11 +29,11 @@ pub async fn chat_completions(
     if req.stream.unwrap_or(false) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let engine = state.engine.clone();
-        tokio::task::spawn_blocking(move || {
+        let generation_handle = tokio::task::spawn_blocking(move || {
             let engine = engine.lock().unwrap();
-            let _ = engine.generate(&messages, &params, |tok| {
+            engine.generate(&messages, &params, |tok| {
                 let _ = tx.send(tok.to_string());
-            });
+            })
         });
 
         let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -49,9 +49,19 @@ pub async fn chat_completions(
                 yield Ok(Event::default().data(serde_json::to_string(&chunk).unwrap()));
             }
 
-            let done = ChatCompletionChunk::finish_chunk(&completion_id, created, &model_for_stream);
-            yield Ok(Event::default().data(serde_json::to_string(&done).unwrap()));
-            yield Ok(Event::default().data("[DONE]"));
+            match generation_handle.await {
+                Ok(Ok(_stats)) => {
+                    let done = ChatCompletionChunk::finish_chunk(&completion_id, created, &model_for_stream);
+                    yield Ok(Event::default().data(serde_json::to_string(&done).unwrap()));
+                    yield Ok(Event::default().data("[DONE]"));
+                }
+                Ok(Err(err)) => {
+                    tracing::error!("generation failed: {err}");
+                }
+                Err(join_err) => {
+                    tracing::error!("generation task panicked: {join_err}");
+                }
+            }
         };
 
         Ok(Sse::new(stream)
