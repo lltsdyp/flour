@@ -5,6 +5,7 @@ use super::openai::{ModelObject, ModelsListResponse};
 use super::AppState;
 
 pub async fn list_models(State(state): State<AppState>) -> Json<ModelsListResponse> {
+    tracing::info!("Received GET /chat/completions");
     let engine = state.engine.lock().unwrap();
     Json(ModelsListResponse {
         object: "list".into(),

@@ -35,7 +35,7 @@ impl Qwen3Config {
         let head_dim = self
             .head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads);
-        Config {
+        let config = Config {
             hidden_size: self.hidden_size,
             intermediate_size: self.intermediate_size,
             vocab_size: self.vocab_size,
@@ -50,7 +50,9 @@ impl Qwen3Config {
             use_qk_norm: true,
             tie_word_embeddings: self.tie_word_embeddings,
             eos_token_id: self.eos_token_id,
-        }
+        };
+        tracing::info!("Successfully loading qwen3 model: {:#?}",config);
+        config
     }
 }
 

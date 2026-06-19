@@ -19,9 +19,11 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
+    tracing::info!("Received POST /chat/completions");
     if req.messages.is_empty() {
         return Err(ApiError::BadRequest("messages must not be empty".into()));
     }
+    tracing::info!("Body: {:?}",req);
     let params: SamplingParams = (&req).into();
     let messages = req.messages.clone();
     let model_id = state.engine.lock().unwrap().model_id().to_string();

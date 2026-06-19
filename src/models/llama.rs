@@ -33,7 +33,7 @@ impl LlamaConfig {
     pub fn into_config(self) -> Config {
         let num_key_value_heads = self.num_key_value_heads.unwrap_or(self.num_attention_heads);
         let head_dim = self.hidden_size / self.num_attention_heads;
-        Config {
+        let config = Config {
             hidden_size: self.hidden_size,
             intermediate_size: self.intermediate_size,
             vocab_size: self.vocab_size,
@@ -48,7 +48,9 @@ impl LlamaConfig {
             use_qk_norm: false,
             tie_word_embeddings: self.tie_word_embeddings,
             eos_token_id: self.eos_token_id,
-        }
+        };
+        tracing::info!("Successfully loading llama model: {:#?}",config);
+        config
     }
 }
 
