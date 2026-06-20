@@ -53,7 +53,7 @@ impl Qwen2Config {
             tie_word_embeddings: self.tie_word_embeddings,
             eos_token_id: self.eos_token_id,
         };
-        tracing::info!("Successfully loading qwen2 model: {:#?}",config);
+        tracing::info!("Successfully loading qwen2 model: {:#?}", config);
         config
     }
 }

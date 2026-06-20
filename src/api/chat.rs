@@ -23,7 +23,7 @@ pub async fn chat_completions(
     if req.messages.is_empty() {
         return Err(ApiError::BadRequest("messages must not be empty".into()));
     }
-    tracing::info!("Body: {:?}",req);
+    tracing::info!("Body: {:?}", req);
     let params: SamplingParams = (&req).into();
     let messages = req.messages.clone();
     let model_id = state.engine.lock().unwrap().model_id().to_string();

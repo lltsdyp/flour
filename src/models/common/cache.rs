@@ -2,16 +2,24 @@ use std::collections::HashMap;
 
 use candle_core::{DType, Device, Result, Tensor};
 
+use super::paged::{BlockAllocator, BlockTable, PagedKvCache};
 use super::Config;
+
+const BLOCK_SIZE: usize = 16;
 
 #[derive(Debug)]
 pub struct Cache {
     cos: Tensor,
     sin: Tensor,
     masks: HashMap<(usize, usize), Tensor>,
-    kvs: Vec<Option<(Tensor, Tensor)>>,
+    allocator: BlockAllocator,
+    table: BlockTable,
+    pool: PagedKvCache,
     max_seq_len: usize,
     device: Device,
+    // Per-forward scratch, (re)computed on layer 0 and reused by later layers.
+    pending_write_slots: Vec<u32>,
+    pending_all_slots: Vec<u32>,
 }
 
 impl Cache {
@@ -30,13 +38,29 @@ impl Cache {
         let cos = idx_theta.cos()?.contiguous()?;
         let sin = idx_theta.sin()?.contiguous()?;
 
+        let num_blocks = cfg.max_seq_len.div_ceil(BLOCK_SIZE);
+        let num_slots = num_blocks * BLOCK_SIZE;
+        let allocator = BlockAllocator::new(num_blocks);
+        let table = BlockTable::new(BLOCK_SIZE);
+        let pool = PagedKvCache::new(
+            cfg.num_hidden_layers,
+            num_slots,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            device,
+        )?;
+
         Ok(Self {
             cos,
             sin,
             masks: HashMap::new(),
-            kvs: vec![None; cfg.num_hidden_layers],
+            allocator,
+            table,
+            pool,
             max_seq_len: cfg.max_seq_len,
             device: device.clone(),
+            pending_write_slots: Vec::new(),
+            pending_all_slots: Vec::new(),
         })
     }
 
@@ -69,19 +93,36 @@ impl Cache {
         k: Tensor,
         v: Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        let (mut k, mut v) = (k, v);
-        if let Some((cache_k, cache_v)) = &self.kvs[layer_idx] {
-            k = Tensor::cat(&[cache_k, &k], 2)?;
-            v = Tensor::cat(&[cache_v, &v], 2)?;
-            let seq_len = k.dims()[2];
-            if seq_len > self.max_seq_len {
-                let trim = seq_len - self.max_seq_len;
-                k = k.narrow(2, trim, self.max_seq_len)?.contiguous()?;
-                v = v.narrow(2, trim, self.max_seq_len)?.contiguous()?;
+        let seq_len = k.dims()[2];
+
+        // Allocation + position bookkeeping happen once per forward, on the first layer.
+        if layer_idx == 0 {
+            let start = self.table.len();
+            let end = start + seq_len;
+            if end > self.max_seq_len {
+                candle_core::bail!(
+                    "paged kv cache overflow: {end} tokens exceeds max_seq_len {}",
+                    self.max_seq_len
+                );
             }
+            while self.table.capacity() < end {
+                let block = self
+                    .allocator
+                    .allocate()
+                    .ok_or_else(|| candle_core::Error::Msg("out of kv blocks".into()))?;
+                self.table.push_block(block);
+            }
+            self.pending_write_slots = self.table.slots(start, end);
+            self.table.advance(seq_len);
+            self.pending_all_slots = self.table.slots(0, self.table.len());
         }
-        self.kvs[layer_idx] = Some((k.clone(), v.clone()));
-        Ok((k, v))
+
+        // Clone the slot lists to release the immutable borrow of `self` before
+        // taking the mutable borrow of `self.pool`.
+        let write_slots = self.pending_write_slots.clone();
+        let all_slots = self.pending_all_slots.clone();
+        self.pool.write(layer_idx, &write_slots, &k, &v)?;
+        self.pool.gather(layer_idx, &all_slots)
     }
 }
 
@@ -169,5 +210,28 @@ mod tests {
         let v2 = k2.clone();
         let (k, _v) = cache.append_kv(0, k2, v2).unwrap();
         assert_eq!(k.dims(), &[1, 2, 3, 4]); // 2 + 1 = 3
+    }
+
+    #[test]
+    fn append_kv_overflow_past_max_seq_len_errors() {
+        let mut cache = Cache::new(&test_config(), &Device::Cpu).unwrap();
+        // max_seq_len = 16; one shot of 17 tokens must error.
+        let k = candle_core::Tensor::zeros((1, 2, 17, 4), candle_core::DType::F32, &Device::Cpu)
+            .unwrap();
+        let v = k.clone();
+        assert!(cache.append_kv(0, k, v).is_err());
+    }
+
+    #[test]
+    fn append_kv_across_two_layers_shares_positions() {
+        let mut cache = Cache::new(&test_config(), &Device::Cpu).unwrap();
+        let k = candle_core::Tensor::zeros((1, 2, 3, 4), candle_core::DType::F32, &Device::Cpu)
+            .unwrap();
+        let v = k.clone();
+        // Layer 0 allocates and advances; layer 1 reuses the same slots, no double-advance.
+        let (k0, _) = cache.append_kv(0, k.clone(), v.clone()).unwrap();
+        let (k1, _) = cache.append_kv(1, k, v).unwrap();
+        assert_eq!(k0.dims(), &[1, 2, 3, 4]);
+        assert_eq!(k1.dims(), &[1, 2, 3, 4]);
     }
 }

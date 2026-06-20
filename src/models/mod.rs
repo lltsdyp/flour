@@ -20,6 +20,8 @@ pub fn detect_family(raw: &serde_json::Value) -> anyhow::Result<ModelFamily> {
         .and_then(|a| a.as_str())
         .ok_or_else(|| anyhow!("config.json missing 'architectures' field"))?;
 
+    tracing::info!("Architecture field: {}", arch);
+
     if arch.starts_with("Llama") {
         Ok(ModelFamily::Llama)
     } else if arch.starts_with("Qwen3") {

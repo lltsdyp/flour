@@ -87,6 +87,8 @@ impl Engine {
         let mut logits = self.model.forward(&input, 0, &mut cache)?;
         let mut completion_tokens = 0usize;
 
+        tracing::info!("Finished prefill, input token count: {} ", all_tokens.len());
+
         for index_pos in (prompt_len..).take(params.max_tokens) {
             let seq_len = logits.dim(1)?;
             let last = logits.i((0, seq_len - 1))?.to_dtype(DType::F32)?;

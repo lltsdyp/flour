@@ -3,6 +3,7 @@ pub mod cache;
 pub mod config;
 pub mod mlp;
 pub mod model;
+pub mod paged;
 pub mod transformer;
 
 pub use attention::CausalSelfAttention;

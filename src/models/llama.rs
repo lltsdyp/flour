@@ -49,7 +49,7 @@ impl LlamaConfig {
             tie_word_embeddings: self.tie_word_embeddings,
             eos_token_id: self.eos_token_id,
         };
-        tracing::info!("Successfully loading llama model: {:#?}",config);
+        tracing::info!("Successfully loading llama model: {:#?}", config);
         config
     }
 }
