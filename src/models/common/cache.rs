@@ -2,24 +2,77 @@ use std::collections::HashMap;
 
 use candle_core::{DType, Device, Result, Tensor};
 
-use super::paged::{BlockAllocator, BlockTable, PagedKvCache};
+use super::paged::{BlockAllocator, BlockTable, PagedKvPool};
 use super::Config;
 
 const BLOCK_SIZE: usize = 16;
+
+#[derive(Debug)]
+pub struct KvCache{
+    pool: PagedKvPool,
+    allocator: BlockAllocator,
+    table: BlockTable,
+}
+
+impl KvCache{
+    pub fn new(cfg: &Config, device: &Device) -> Result<Self> {
+        let num_blocks = cfg.max_seq_len.div_ceil(BLOCK_SIZE);
+        let num_slots = num_blocks * BLOCK_SIZE;
+        let allocator = BlockAllocator::new(num_blocks);
+        let table = BlockTable::new(BLOCK_SIZE);
+        let pool = PagedKvPool::new(
+            cfg.num_hidden_layers,
+            num_slots,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            device,
+        )?;
+
+        Ok(Self {
+            pool,
+            allocator,
+            table
+        })
+    }
+
+    pub fn allocate(&mut self) -> Option<usize> {
+        let block = self.allocator.allocate()?;
+        self.table.push_block(block);
+        Some(block)
+    }
+
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    pub fn capacity(&self) -> usize{
+        self.table.capacity()
+    }
+
+    pub fn slots(&self,start: usize,end: usize) -> Vec<u32>{
+        self.table.slots(start, end)
+    }
+
+    pub fn write(&mut self, layer_idx: usize, slots: &[u32], k: &Tensor, v: &Tensor) -> Result<()>{
+        self.pool.write(layer_idx, slots, k, v)
+    }
+
+    pub fn gather(&self, layer_idx: usize, slots: &[u32]) -> Result<(Tensor, Tensor)> {
+        self.pool.gather(layer_idx, slots)
+    }
+    pub fn advance(&mut self, seq_len: usize) {
+        self.table.advance(seq_len);
+    }   
+}
 
 #[derive(Debug)]
 pub struct Cache {
     cos: Tensor,
     sin: Tensor,
     masks: HashMap<(usize, usize), Tensor>,
-    allocator: BlockAllocator,
-    table: BlockTable,
-    pool: PagedKvCache,
+    kvs: KvCache,
     max_seq_len: usize,
     device: Device,
-    // Per-forward scratch, (re)computed on layer 0 and reused by later layers.
-    pending_write_slots: Vec<u32>,
-    pending_all_slots: Vec<u32>,
 }
 
 impl Cache {
@@ -38,29 +91,13 @@ impl Cache {
         let cos = idx_theta.cos()?.contiguous()?;
         let sin = idx_theta.sin()?.contiguous()?;
 
-        let num_blocks = cfg.max_seq_len.div_ceil(BLOCK_SIZE);
-        let num_slots = num_blocks * BLOCK_SIZE;
-        let allocator = BlockAllocator::new(num_blocks);
-        let table = BlockTable::new(BLOCK_SIZE);
-        let pool = PagedKvCache::new(
-            cfg.num_hidden_layers,
-            num_slots,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-            device,
-        )?;
-
         Ok(Self {
             cos,
             sin,
             masks: HashMap::new(),
-            allocator,
-            table,
-            pool,
+            kvs: KvCache::new(cfg, device)?,
             max_seq_len: cfg.max_seq_len,
             device: device.clone(),
-            pending_write_slots: Vec::new(),
-            pending_all_slots: Vec::new(),
         })
     }
 
@@ -87,42 +124,43 @@ impl Cache {
         Ok(self.masks.get(&key).unwrap().clone())
     }
 
+    pub fn allocate_kv(&mut self,seq_len: usize) -> Result<()>{
+    let start = self.kvs.len();
+    let end = start + seq_len;
+
+    if end > self.max_seq_len {
+        candle_core::bail!(
+            "paged kv cache overflow: {end} tokens exceeds max_seq_len {}",
+            self.max_seq_len
+        );
+    }
+
+    while self.kvs.capacity() < end {
+        self.kvs
+            .allocate()
+            .ok_or_else(|| candle_core::Error::Msg("out of kv blocks".into()))?;
+    }
+    self.kvs.advance(seq_len);
+    Ok(())
+    }
+
     pub fn append_kv(
         &mut self,
         layer_idx: usize,
         k: Tensor,
         v: Tensor,
     ) -> Result<(Tensor, Tensor)> {
+        // Blocks are reserved and the logical length advanced once per batch by
+        // `allocate_kv` (called from the model's forward, before any layer runs). Here `len`
+        // already includes this batch's tokens, so the new window is the trailing `seq_len`.
         let seq_len = k.dims()[2];
+        let end = self.kvs.len();
+        let start = end - seq_len;
+        let write_slots = self.kvs.slots(start, end);
+        let all_slots = self.kvs.slots(0, end);
 
-        // Allocation + position bookkeeping happen once per forward, on the first layer.
-        if layer_idx == 0 {
-            let start = self.table.len();
-            let end = start + seq_len;
-            if end > self.max_seq_len {
-                candle_core::bail!(
-                    "paged kv cache overflow: {end} tokens exceeds max_seq_len {}",
-                    self.max_seq_len
-                );
-            }
-            while self.table.capacity() < end {
-                let block = self
-                    .allocator
-                    .allocate()
-                    .ok_or_else(|| candle_core::Error::Msg("out of kv blocks".into()))?;
-                self.table.push_block(block);
-            }
-            self.pending_write_slots = self.table.slots(start, end);
-            self.table.advance(seq_len);
-            self.pending_all_slots = self.table.slots(0, self.table.len());
-        }
-
-        // Clone the slot lists to release the immutable borrow of `self` before
-        // taking the mutable borrow of `self.pool`.
-        let write_slots = self.pending_write_slots.clone();
-        let all_slots = self.pending_all_slots.clone();
-        self.pool.write(layer_idx, &write_slots, &k, &v)?;
-        self.pool.gather(layer_idx, &all_slots)
+        self.kvs.write(layer_idx, &write_slots, &k, &v)?;
+        self.kvs.gather(layer_idx, &all_slots)
     }
 }
 
@@ -199,12 +237,14 @@ mod tests {
     #[test]
     fn append_kv_concatenates_along_seq_dim() {
         let mut cache = Cache::new(&test_config(), &Device::Cpu).unwrap();
+        cache.allocate_kv(2).unwrap();
         let k1 = candle_core::Tensor::zeros((1, 2, 2, 4), candle_core::DType::F32, &Device::Cpu)
             .unwrap();
         let v1 = k1.clone();
         let (k, _v) = cache.append_kv(0, k1, v1).unwrap();
         assert_eq!(k.dims(), &[1, 2, 2, 4]);
 
+        cache.allocate_kv(1).unwrap();
         let k2 = candle_core::Tensor::zeros((1, 2, 1, 4), candle_core::DType::F32, &Device::Cpu)
             .unwrap();
         let v2 = k2.clone();
@@ -215,11 +255,8 @@ mod tests {
     #[test]
     fn append_kv_overflow_past_max_seq_len_errors() {
         let mut cache = Cache::new(&test_config(), &Device::Cpu).unwrap();
-        // max_seq_len = 16; one shot of 17 tokens must error.
-        let k = candle_core::Tensor::zeros((1, 2, 17, 4), candle_core::DType::F32, &Device::Cpu)
-            .unwrap();
-        let v = k.clone();
-        assert!(cache.append_kv(0, k, v).is_err());
+        // max_seq_len = 16; reserving 17 tokens in one shot must error.
+        assert!(cache.allocate_kv(17).is_err());
     }
 
     #[test]
@@ -228,7 +265,8 @@ mod tests {
         let k = candle_core::Tensor::zeros((1, 2, 3, 4), candle_core::DType::F32, &Device::Cpu)
             .unwrap();
         let v = k.clone();
-        // Layer 0 allocates and advances; layer 1 reuses the same slots, no double-advance.
+        // allocate_kv advances once for the batch; both layers reuse the same slots.
+        cache.allocate_kv(3).unwrap();
         let (k0, _) = cache.append_kv(0, k.clone(), v.clone()).unwrap();
         let (k1, _) = cache.append_kv(1, k, v).unwrap();
         assert_eq!(k0.dims(), &[1, 2, 3, 4]);

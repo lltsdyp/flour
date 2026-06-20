@@ -80,7 +80,7 @@ impl BlockTable {
 /// for K and V. Writes address individual slots; gather reads a slot list back into
 /// a contiguous `(1, kv_heads, n, head_dim)` tensor for the dense attention kernel.
 #[derive(Debug)]
-pub struct PagedKvCache {
+pub struct PagedKvPool {
     k_pools: Vec<Tensor>,
     v_pools: Vec<Tensor>,
     kv_heads: usize,
@@ -88,7 +88,7 @@ pub struct PagedKvCache {
     device: Device,
 }
 
-impl PagedKvCache {
+impl PagedKvPool {
     pub fn new(
         num_layers: usize,
         num_slots: usize,
@@ -161,7 +161,7 @@ mod tests {
     fn paged_pool_write_then_gather_round_trips() {
         // 1 layer, 4 slots, 1 kv head, head_dim 2.
         let dev = Device::Cpu;
-        let mut pool = PagedKvCache::new(1, 4, 1, 2, &dev).unwrap();
+        let mut pool = PagedKvPool::new(1, 4, 1, 2, &dev).unwrap();
 
         // Two tokens written to slots 2 and 0 (deliberately out of order).
         // k shape: (1, kv_heads=1, seq=2, head_dim=2)

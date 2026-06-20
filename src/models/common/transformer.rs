@@ -122,6 +122,7 @@ mod tests {
         let layer = DecoderLayer::load(make_vb(&cfg), &cfg).unwrap();
         let mut cache = Cache::new(&cfg, &Device::Cpu).unwrap();
         let x = make_tensor(&[1, 4, cfg.hidden_size], 50);
+        cache.allocate_kv(4).unwrap();
         let y = layer.forward(&x, 0, 0, &mut cache).unwrap();
         assert_eq!(y.dims(), &[1, 4, cfg.hidden_size]);
     }

@@ -191,6 +191,7 @@ mod tests {
         let attn = CausalSelfAttention::load(make_vb(&cfg), &cfg).unwrap();
         let mut cache = super::super::Cache::new(&cfg, &Device::Cpu).unwrap();
         let x = make_tensor(&[1, 5, cfg.hidden_size], 100);
+        cache.allocate_kv(5).unwrap();
         let y = attn.forward(&x, 0, 0, &mut cache).unwrap();
         assert_eq!(y.dims(), &[1, 5, cfg.hidden_size]);
     }
@@ -201,6 +202,7 @@ mod tests {
         let attn = CausalSelfAttention::load(make_vb(&cfg), &cfg).unwrap();
         let mut cache = super::super::Cache::new(&cfg, &Device::Cpu).unwrap();
         let x = make_tensor(&[1, 5, cfg.hidden_size], 101);
+        cache.allocate_kv(5).unwrap();
         let y = attn.forward(&x, 0, 0, &mut cache).unwrap();
         assert_eq!(y.dims(), &[1, 5, cfg.hidden_size]);
     }
@@ -211,8 +213,10 @@ mod tests {
         let attn = CausalSelfAttention::load(make_vb(&cfg), &cfg).unwrap();
         let mut cache = super::super::Cache::new(&cfg, &Device::Cpu).unwrap();
         let prefill = make_tensor(&[1, 3, cfg.hidden_size], 102);
+        cache.allocate_kv(3).unwrap();
         attn.forward(&prefill, 0, 0, &mut cache).unwrap();
         let step = make_tensor(&[1, 1, cfg.hidden_size], 103);
+        cache.allocate_kv(1).unwrap();
         let y = attn.forward(&step, 3, 0, &mut cache).unwrap();
         assert_eq!(y.dims(), &[1, 1, cfg.hidden_size]);
     }

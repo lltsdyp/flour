@@ -47,6 +47,10 @@ impl CausalLM {
         cache: &mut Cache,
     ) -> Result<Tensor> {
         let mut x = self.embed_tokens.forward(input_ids)?;
+        // Reserve KV slots for this batch's tokens once, before any layer writes. All layers
+        // share these logical positions, so allocation/advance happens here, not per layer.
+        let (_b_sz, seq_len) = input_ids.dims2()?;
+        cache.allocate_kv(seq_len)?;
         for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward(&x, index_pos, i, cache)?;
         }
