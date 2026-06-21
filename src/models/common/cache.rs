@@ -8,13 +8,13 @@ use super::Config;
 const BLOCK_SIZE: usize = 16;
 
 #[derive(Debug)]
-pub struct KvCache{
+pub struct KvCache {
     pool: PagedKvPool,
     allocator: BlockAllocator,
     table: BlockTable,
 }
 
-impl KvCache{
+impl KvCache {
     pub fn new(cfg: &Config, device: &Device) -> Result<Self> {
         let num_blocks = cfg.max_seq_len.div_ceil(BLOCK_SIZE);
         let num_slots = num_blocks * BLOCK_SIZE;
@@ -31,7 +31,7 @@ impl KvCache{
         Ok(Self {
             pool,
             allocator,
-            table
+            table,
         })
     }
 
@@ -45,24 +45,50 @@ impl KvCache{
         self.table.len()
     }
 
-    pub fn capacity(&self) -> usize{
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    pub fn capacity(&self) -> usize {
         self.table.capacity()
     }
 
-    pub fn slots(&self,start: usize,end: usize) -> Vec<u32>{
+    pub fn slots(&self, start: usize, end: usize) -> Vec<u32> {
         self.table.slots(start, end)
     }
 
-    pub fn write(&mut self, layer_idx: usize, slots: &[u32], k: &Tensor, v: &Tensor) -> Result<()>{
-        self.pool.write(layer_idx, slots, k, v)
-    }
-
-    pub fn gather(&self, layer_idx: usize, slots: &[u32]) -> Result<(Tensor, Tensor)> {
-        self.pool.gather(layer_idx, slots)
-    }
     pub fn advance(&mut self, seq_len: usize) {
         self.table.advance(seq_len);
-    }   
+    }
+
+    /// Write the trailing `seq_len` tokens of this batch into their reserved slots.
+    /// Blocks must already be reserved by `Cache::allocate_kv` before calling.
+    pub fn write_current(&mut self, layer_idx: usize, k: &Tensor, v: &Tensor) -> Result<()> {
+        let seq_len = k.dims()[2];
+        let end = self.table.len();
+        let start = end - seq_len;
+        let slots = self.table.slots(start, end);
+        self.pool.write(layer_idx, &slots, k, v)
+    }
+
+    /// View the live KV (logical positions `0..len`) one physical block at a time, in
+    /// logical order. Each entry is a zero-copy `(k, v)` view shaped
+    /// `(1, kv_heads, block_n, head_dim)`: slots inside a block are physically contiguous,
+    /// so each block is a `narrow` view rather than a gather.
+    pub fn gather_blocks(&self, layer_idx: usize) -> Result<Vec<(Tensor, Tensor)>> {
+        let len = self.table.len();
+        let block_size = self.table.block_size();
+        let num_blocks = len.div_ceil(block_size);
+        let mut blocks = Vec::with_capacity(num_blocks);
+        for b in 0..num_blocks {
+            let start = b * block_size;
+            let n = block_size.min(len - start);
+            // The first token of a logical block maps to the start of its physical block.
+            let start_slot = self.table.slot(start);
+            blocks.push(self.pool.block_view(layer_idx, start_slot, n)?);
+        }
+        Ok(blocks)
+    }
 }
 
 #[derive(Debug)]
@@ -124,43 +150,35 @@ impl Cache {
         Ok(self.masks.get(&key).unwrap().clone())
     }
 
-    pub fn allocate_kv(&mut self,seq_len: usize) -> Result<()>{
-    let start = self.kvs.len();
-    let end = start + seq_len;
+    pub fn allocate_kv(&mut self, seq_len: usize) -> Result<()> {
+        let start = self.kvs.len();
+        let end = start + seq_len;
 
-    if end > self.max_seq_len {
-        candle_core::bail!(
-            "paged kv cache overflow: {end} tokens exceeds max_seq_len {}",
-            self.max_seq_len
-        );
+        if end > self.max_seq_len {
+            candle_core::bail!(
+                "paged kv cache overflow: {end} tokens exceeds max_seq_len {}",
+                self.max_seq_len
+            );
+        }
+
+        while self.kvs.capacity() < end {
+            self.kvs
+                .allocate()
+                .ok_or_else(|| candle_core::Error::Msg("out of kv blocks".into()))?;
+        }
+        self.kvs.advance(seq_len);
+        Ok(())
     }
 
-    while self.kvs.capacity() < end {
-        self.kvs
-            .allocate()
-            .ok_or_else(|| candle_core::Error::Msg("out of kv blocks".into()))?;
-    }
-    self.kvs.advance(seq_len);
-    Ok(())
+    /// Persist this batch's K/V into the paged pool without gathering it back. Pair with
+    /// [`Cache::kv_blocks`] + `backend::cpu::paged_attention` for the streaming kernel path.
+    pub fn write_kv(&mut self, layer_idx: usize, k: &Tensor, v: &Tensor) -> Result<()> {
+        self.kvs.write_current(layer_idx, k, v)
     }
 
-    pub fn append_kv(
-        &mut self,
-        layer_idx: usize,
-        k: Tensor,
-        v: Tensor,
-    ) -> Result<(Tensor, Tensor)> {
-        // Blocks are reserved and the logical length advanced once per batch by
-        // `allocate_kv` (called from the model's forward, before any layer runs). Here `len`
-        // already includes this batch's tokens, so the new window is the trailing `seq_len`.
-        let seq_len = k.dims()[2];
-        let end = self.kvs.len();
-        let start = end - seq_len;
-        let write_slots = self.kvs.slots(start, end);
-        let all_slots = self.kvs.slots(0, end);
-
-        self.kvs.write(layer_idx, &write_slots, &k, &v)?;
-        self.kvs.gather(layer_idx, &all_slots)
+    /// The full live KV for a layer, returned block-by-block in logical order.
+    pub fn kv_blocks(&self, layer_idx: usize) -> Result<Vec<(Tensor, Tensor)>> {
+        self.kvs.gather_blocks(layer_idx)
     }
 }
 
@@ -234,42 +252,62 @@ mod tests {
         assert_eq!(mask, vec![0, 0, 0]);
     }
 
+    /// Total kv length recovered from the block views.
+    fn block_kv_len(blocks: &[(candle_core::Tensor, candle_core::Tensor)]) -> usize {
+        blocks.iter().map(|(k, _)| k.dims()[2]).sum()
+    }
+
     #[test]
-    fn append_kv_concatenates_along_seq_dim() {
+    fn write_kv_then_blocks_spans_appended_batches() {
         let mut cache = Cache::new(&test_config(), &Device::Cpu).unwrap();
         cache.allocate_kv(2).unwrap();
         let k1 = candle_core::Tensor::zeros((1, 2, 2, 4), candle_core::DType::F32, &Device::Cpu)
             .unwrap();
-        let v1 = k1.clone();
-        let (k, _v) = cache.append_kv(0, k1, v1).unwrap();
-        assert_eq!(k.dims(), &[1, 2, 2, 4]);
+        cache.write_kv(0, &k1, &k1).unwrap();
+        let blocks = cache.kv_blocks(0).unwrap();
+        assert_eq!(block_kv_len(&blocks), 2);
+        assert_eq!(blocks[0].0.dims(), &[1, 2, 2, 4]);
 
+        // A second batch extends the live window; block views now cover 2 + 1 = 3 positions.
         cache.allocate_kv(1).unwrap();
         let k2 = candle_core::Tensor::zeros((1, 2, 1, 4), candle_core::DType::F32, &Device::Cpu)
             .unwrap();
-        let v2 = k2.clone();
-        let (k, _v) = cache.append_kv(0, k2, v2).unwrap();
-        assert_eq!(k.dims(), &[1, 2, 3, 4]); // 2 + 1 = 3
+        cache.write_kv(0, &k2, &k2).unwrap();
+        assert_eq!(block_kv_len(&cache.kv_blocks(0).unwrap()), 3);
     }
 
     #[test]
-    fn append_kv_overflow_past_max_seq_len_errors() {
+    fn allocate_kv_overflow_past_max_seq_len_errors() {
         let mut cache = Cache::new(&test_config(), &Device::Cpu).unwrap();
         // max_seq_len = 16; reserving 17 tokens in one shot must error.
         assert!(cache.allocate_kv(17).is_err());
     }
 
     #[test]
-    fn append_kv_across_two_layers_shares_positions() {
+    fn write_kv_across_two_layers_shares_positions() {
         let mut cache = Cache::new(&test_config(), &Device::Cpu).unwrap();
         let k = candle_core::Tensor::zeros((1, 2, 3, 4), candle_core::DType::F32, &Device::Cpu)
             .unwrap();
-        let v = k.clone();
         // allocate_kv advances once for the batch; both layers reuse the same slots.
         cache.allocate_kv(3).unwrap();
-        let (k0, _) = cache.append_kv(0, k.clone(), v.clone()).unwrap();
-        let (k1, _) = cache.append_kv(1, k, v).unwrap();
-        assert_eq!(k0.dims(), &[1, 2, 3, 4]);
-        assert_eq!(k1.dims(), &[1, 2, 3, 4]);
+        cache.write_kv(0, &k, &k).unwrap();
+        cache.write_kv(1, &k, &k).unwrap();
+        assert_eq!(block_kv_len(&cache.kv_blocks(0).unwrap()), 3);
+        assert_eq!(block_kv_len(&cache.kv_blocks(1).unwrap()), 3);
+    }
+
+    #[test]
+    fn kv_blocks_round_trips_written_values() {
+        // Two-token write across a single block must read back identically (zero-copy view).
+        let cfg = test_config();
+        let mut cache = Cache::new(&cfg, &Device::Cpu).unwrap();
+        cache.allocate_kv(2).unwrap();
+        let data: Vec<f32> = (0..(2 * 2 * 4)).map(|i| i as f32).collect();
+        let k = candle_core::Tensor::from_vec(data.clone(), (1, 2, 2, 4), &Device::Cpu).unwrap();
+        cache.write_kv(0, &k, &k).unwrap();
+        let blocks = cache.kv_blocks(0).unwrap();
+        let got: Vec<f32> = blocks[0].0.flatten_all().unwrap().to_vec1().unwrap();
+        let want: Vec<f32> = k.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(got, want);
     }
 }

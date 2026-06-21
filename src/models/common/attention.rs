@@ -1,7 +1,7 @@
 use candle_core::{Result, Tensor};
 use candle_nn::{linear_no_bias, Linear, Module, RmsNorm, VarBuilder};
 
-use crate::backend::cpu::{causal_attention, repeat_kv};
+use crate::backend::cpu::paged_attention;
 
 use super::{Cache, Config};
 
@@ -98,20 +98,15 @@ impl CausalSelfAttention {
         let q = candle_nn::rotary_emb::rope(&q, &cos, &sin)?;
         let k = candle_nn::rotary_emb::rope(&k, &cos, &sin)?;
 
-        let (k, v) = cache.append_kv(layer_idx, k, v)?;
-        let kv_seq_len = k.dims()[2];
+        // Stream attention straight over the paged KV blocks: write this batch's K/V into
+        // the pool, then run the PagedAttention kernel without materializing the whole
+        // key/value sequence as one dense tensor.
+        cache.write_kv(layer_idx, &k, &v)?;
+        let blocks = cache.kv_blocks(layer_idx)?;
 
         let n_rep = self.num_attention_heads / self.num_key_value_heads;
-        let k = repeat_kv(k, n_rep)?;
-        let v = repeat_kv(v, n_rep)?;
-
         let scale = 1f64 / (self.head_dim as f64).sqrt();
-        let y = if seq_len > 1 || kv_seq_len > 1 {
-            let mask = cache.causal_mask(seq_len, kv_seq_len)?;
-            causal_attention(&q, &k, &v, Some(&mask), scale)?
-        } else {
-            causal_attention(&q, &k, &v, None, scale)?
-        };
+        let y = paged_attention(&q, &blocks, n_rep, scale)?;
 
         let y = y.transpose(1, 2)?.reshape((
             b_sz,

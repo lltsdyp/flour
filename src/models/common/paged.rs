@@ -52,6 +52,10 @@ impl BlockTable {
         self.len == 0
     }
 
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
     /// Total token slots currently backed by allocated blocks.
     pub fn capacity(&self) -> usize {
         self.blocks.len() * self.block_size
@@ -76,9 +80,10 @@ impl BlockTable {
     }
 }
 
-/// Physical KV storage: per layer, a flat pool of `(num_slots, kv_heads, head_dim)`
-/// for K and V. Writes address individual slots; gather reads a slot list back into
-/// a contiguous `(1, kv_heads, n, head_dim)` tensor for the dense attention kernel.
+/// Physical KV storage: per layer, a flat pool of `(kv_heads, num_slots, head_dim)`
+/// for K and V. The slot axis sits in the middle so the attention-ready layout
+/// `(1, kv_heads, n, head_dim)` is reachable by `narrow` + `unsqueeze` alone — reading a
+/// contiguous run of slots (one paged block) is a zero-copy view, never a gather.
 #[derive(Debug)]
 pub struct PagedKvPool {
     k_pools: Vec<Tensor>,
@@ -100,12 +105,12 @@ impl PagedKvPool {
         let mut v_pools = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
             k_pools.push(Tensor::zeros(
-                (num_slots, kv_heads, head_dim),
+                (kv_heads, num_slots, head_dim),
                 DType::F32,
                 device,
             )?);
             v_pools.push(Tensor::zeros(
-                (num_slots, kv_heads, head_dim),
+                (kv_heads, num_slots, head_dim),
                 DType::F32,
                 device,
             )?);
@@ -120,34 +125,46 @@ impl PagedKvPool {
     }
 
     pub fn write(&mut self, layer_idx: usize, slots: &[u32], k: &Tensor, v: &Tensor) -> Result<()> {
-        // (1, kv_heads, seq, head_dim) -> (seq, kv_heads, head_dim)
-        let kt = k.squeeze(0)?.transpose(0, 1)?.contiguous()?;
-        let vt = v.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+        // (1, kv_heads, seq, head_dim) -> (kv_heads, seq, head_dim); slot axis already aligned.
+        let kt = k.squeeze(0)?;
+        let vt = v.squeeze(0)?;
         for (i, &slot) in slots.iter().enumerate() {
             let slot = slot as usize;
-            let k_tok = kt.narrow(0, i, 1)?; // (1, kv_heads, head_dim)
-            let v_tok = vt.narrow(0, i, 1)?;
-            let ranges = [slot..slot + 1, 0..self.kv_heads, 0..self.head_dim];
+            let k_tok = kt.narrow(1, i, 1)?; // (kv_heads, 1, head_dim)
+            let v_tok = vt.narrow(1, i, 1)?;
+            let ranges = [0..self.kv_heads, slot..slot + 1, 0..self.head_dim];
             self.k_pools[layer_idx] = self.k_pools[layer_idx].slice_assign(&ranges, &k_tok)?;
             self.v_pools[layer_idx] = self.v_pools[layer_idx].slice_assign(&ranges, &v_tok)?;
         }
         Ok(())
     }
 
+    /// Read an arbitrary slot list back as `(1, kv_heads, n, head_dim)`. The gather (one
+    /// `index_select`) is unavoidable for non-contiguous slots; prefer [`Self::block_view`]
+    /// when the slots form a contiguous run.
     pub fn gather(&self, layer_idx: usize, slots: &[u32]) -> Result<(Tensor, Tensor)> {
-        let n = slots.len();
         let idx = Tensor::new(slots, &self.device)?;
-        let k = self.k_pools[layer_idx].index_select(&idx, 0)?; // (n, kv_heads, head_dim)
-        let v = self.v_pools[layer_idx].index_select(&idx, 0)?;
-        // (n, kv_heads, head_dim) -> (1, kv_heads, n, head_dim)
-        let k = k
-            .reshape((1, n, self.kv_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let v = v
-            .reshape((1, n, self.kv_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
+        let k = self.k_pools[layer_idx].index_select(&idx, 1)?; // (kv_heads, n, head_dim)
+        let v = self.v_pools[layer_idx].index_select(&idx, 1)?;
+        Ok((k.unsqueeze(0)?, v.unsqueeze(0)?))
+    }
+
+    /// Zero-copy view of `n` contiguous slots starting at `start_slot`, as
+    /// `(1, kv_heads, n, head_dim)`. Used to feed one paged block straight into the
+    /// PagedAttention kernel without materializing a copy. Slots within a single paged block
+    /// are always physically contiguous (see `BlockTable::slot`), so this is the read path.
+    pub fn block_view(
+        &self,
+        layer_idx: usize,
+        start_slot: usize,
+        n: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let k = self.k_pools[layer_idx]
+            .narrow(1, start_slot, n)?
+            .unsqueeze(0)?;
+        let v = self.v_pools[layer_idx]
+            .narrow(1, start_slot, n)?
+            .unsqueeze(0)?;
         Ok((k, v))
     }
 }

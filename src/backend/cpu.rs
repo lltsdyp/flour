@@ -1,4 +1,4 @@
-use candle_core::{DType, Result, Tensor};
+use candle_core::{DType, Result, Tensor, D};
 
 /// Expand `(b, n_kv_heads, seq, head_dim)` to `(b, n_kv_heads * n_rep, seq, head_dim)`
 /// by repeating each KV head `n_rep` times, for grouped-query attention.
@@ -41,6 +41,70 @@ pub fn causal_attention(
     att.matmul(&v.contiguous()?)
 }
 
+/// PagedAttention kernel.
+///
+/// Computes causal scaled-dot-product attention by streaming over the paged KV blocks
+/// instead of materializing the whole key/value sequence at once. Each `blocks` entry is
+/// one physical KV block gathered from the pool, shaped `(1, kv_heads, block_n, head_dim)`
+/// for K and V respectively, in logical (ascending kv-position) order. Partial results are
+/// folded together with a flash-attention-style online softmax, so only a single block of
+/// scores is ever resident.
+///
+/// `q`: `(b, num_heads, seq_q, head_dim)` (already RoPE-encoded). `n_rep` repeats each KV
+/// head to match the query head count for grouped-query attention. Causal masking places the
+/// `seq_q` query positions at the tail of the KV sequence: query `i` attends kv position `j`
+/// iff `j <= (kv_len - seq_q) + i`.
+pub fn paged_attention(
+    q: &Tensor,
+    blocks: &[(Tensor, Tensor)],
+    n_rep: usize,
+    scale: f64,
+) -> Result<Tensor> {
+    let (b_sz, num_heads, seq_q, head_dim) = q.dims4()?;
+    let device = q.device();
+    let kv_len: usize = blocks.iter().map(|(k, _)| k.dims()[2]).sum();
+    // New query positions occupy the trailing `seq_q` kv columns; everything earlier is
+    // already-cached context that every query can see.
+    let offset = kv_len - seq_q;
+
+    // Running flash-attention state, one scalar per (batch, head, query) row.
+    let mut running_max = Tensor::full(f32::NEG_INFINITY, (b_sz, num_heads, seq_q, 1), device)?;
+    let mut running_sum = Tensor::zeros((b_sz, num_heads, seq_q, 1), DType::F32, device)?;
+    let mut acc = Tensor::zeros((b_sz, num_heads, seq_q, head_dim), DType::F32, device)?;
+
+    let mut kv_start = 0usize;
+    for (k, v) in blocks {
+        let block_n = k.dims()[2];
+        let k = repeat_kv(k.clone(), n_rep)?;
+        let v = repeat_kv(v.clone(), n_rep)?;
+
+        // (b, heads, seq_q, block_n)
+        let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
+
+        // Per-block causal mask: kv position `kv_start + j` is in the future of query `i`
+        // (global position `offset + i`) when `kv_start + j > offset + i`.
+        let mask: Vec<u8> = (0..seq_q)
+            .flat_map(|i| (0..block_n).map(move |j| u8::from(kv_start + j > offset + i)))
+            .collect();
+        let mask =
+            Tensor::from_slice(&mask, (seq_q, block_n), device)?.broadcast_as(scores.shape())?;
+        let scores = masked_fill(&scores, &mask, f32::NEG_INFINITY)?;
+
+        let block_max = scores.max_keepdim(D::Minus1)?; // (b, heads, seq_q, 1)
+        let new_max = running_max.maximum(&block_max)?;
+        // Rescale the prior accumulation onto the new running maximum.
+        let correction = running_max.broadcast_sub(&new_max)?.exp()?; // (b, heads, seq_q, 1)
+        let probs = scores.broadcast_sub(&new_max)?.exp()?; // (b, heads, seq_q, block_n)
+
+        running_sum = (running_sum.broadcast_mul(&correction)? + probs.sum_keepdim(D::Minus1)?)?;
+        acc = (acc.broadcast_mul(&correction)? + probs.matmul(&v.contiguous()?)?)?;
+        running_max = new_max;
+        kv_start += block_n;
+    }
+
+    acc.broadcast_div(&running_sum)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,6 +128,111 @@ mod tests {
             .unwrap();
         let y = repeat_kv(x, 3).unwrap();
         assert_eq!(y.dims(), &[1, 6, 3, 4]);
+    }
+
+    fn rand_tensor(shape: &[usize], seed: u64) -> Tensor {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        let numel: usize = shape.iter().product();
+        let mut rng = StdRng::seed_from_u64(seed);
+        let data: Vec<f32> = (0..numel).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        Tensor::from_vec(data, shape, &Device::Cpu).unwrap()
+    }
+
+    /// Dense reference: full causal attention over a contiguous KV tensor.
+    fn dense_reference(q: &Tensor, k: &Tensor, v: &Tensor, n_rep: usize, scale: f64) -> Vec<f32> {
+        let seq_q = q.dims()[2];
+        let kv_len = k.dims()[2];
+        let offset = kv_len - seq_q;
+        let mask: Vec<u8> = (0..seq_q)
+            .flat_map(|i| (0..kv_len).map(move |j| u8::from(j > i + offset)))
+            .collect();
+        let mask = Tensor::from_slice(&mask, (seq_q, kv_len), &Device::Cpu).unwrap();
+        let k = repeat_kv(k.clone(), n_rep).unwrap();
+        let v = repeat_kv(v.clone(), n_rep).unwrap();
+        causal_attention(q, &k, &v, Some(&mask), scale)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    }
+
+    /// Split a `(1, kv_heads, kv_len, head_dim)` tensor into `block_size`-wide blocks along seq.
+    fn into_blocks(k: &Tensor, v: &Tensor, block_size: usize) -> Vec<(Tensor, Tensor)> {
+        let kv_len = k.dims()[2];
+        let mut blocks = Vec::new();
+        let mut start = 0;
+        while start < kv_len {
+            let n = block_size.min(kv_len - start);
+            blocks.push((
+                k.narrow(2, start, n).unwrap().contiguous().unwrap(),
+                v.narrow(2, start, n).unwrap().contiguous().unwrap(),
+            ));
+            start += n;
+        }
+        blocks
+    }
+
+    fn assert_close(a: &[f32], b: &[f32]) {
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!((x - y).abs() < 1e-4, "mismatch: {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn paged_attention_matches_dense_prefill() {
+        let scale = 1.0 / (4f64).sqrt();
+        let q = rand_tensor(&[1, 2, 5, 4], 1); // 2 heads, seq 5, head_dim 4
+        let k = rand_tensor(&[1, 2, 5, 4], 2);
+        let v = rand_tensor(&[1, 2, 5, 4], 3);
+        let reference = dense_reference(&q, &k, &v, 1, scale);
+        // Blocks of 2 -> last block partially filled (5 = 2 + 2 + 1).
+        let blocks = into_blocks(&k, &v, 2);
+        let out = paged_attention(&q, &blocks, 1, scale)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_close(&out, &reference);
+    }
+
+    #[test]
+    fn paged_attention_matches_dense_decode_step() {
+        let scale = 1.0 / (4f64).sqrt();
+        // Single query attending to 7 cached kv positions (decode step).
+        let q = rand_tensor(&[1, 2, 1, 4], 10);
+        let k = rand_tensor(&[1, 2, 7, 4], 11);
+        let v = rand_tensor(&[1, 2, 7, 4], 12);
+        let reference = dense_reference(&q, &k, &v, 1, scale);
+        let blocks = into_blocks(&k, &v, 3);
+        let out = paged_attention(&q, &blocks, 1, scale)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_close(&out, &reference);
+    }
+
+    #[test]
+    fn paged_attention_matches_dense_with_gqa() {
+        let scale = 1.0 / (4f64).sqrt();
+        // 4 query heads, 2 kv heads -> n_rep = 2.
+        let q = rand_tensor(&[1, 4, 6, 4], 20);
+        let k = rand_tensor(&[1, 2, 6, 4], 21);
+        let v = rand_tensor(&[1, 2, 6, 4], 22);
+        let reference = dense_reference(&q, &k, &v, 2, scale);
+        let blocks = into_blocks(&k, &v, 4);
+        let out = paged_attention(&q, &blocks, 2, scale)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_close(&out, &reference);
     }
 
     #[test]
