@@ -14,6 +14,7 @@ use crate::tokenizer::{ChatMessage, ChatTemplate, Tokenizer};
 pub struct GenerationStats {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
+    pub reused_prefix_tokens: usize,
 }
 
 pub struct Engine {
@@ -23,6 +24,7 @@ pub struct Engine {
     eos_token_id: EosTokenId,
     device: Device,
     model_id: String,
+    cache: std::sync::Mutex<Cache>,
 }
 
 impl Engine {
@@ -38,6 +40,7 @@ impl Engine {
         let device = Device::Cpu;
         let vb = load_var_builder(model_dir, DType::F32, &device)?;
         let model = CausalLM::load(vb, cfg.clone())?;
+        let cache = std::sync::Mutex::new(Cache::new(&cfg, &device)?);
 
         let tokenizer = Tokenizer::from_file(&model_dir.join("tokenizer.json"))?;
         let chat_template = ChatTemplate::for_family(family);
@@ -62,6 +65,7 @@ impl Engine {
             eos_token_id,
             device,
             model_id,
+            cache,
         })
     }
 
@@ -79,15 +83,20 @@ impl Engine {
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
         let prompt_len = prompt_tokens.len();
 
-        let mut cache = Cache::new(self.model.config(), &self.device)?;
+        let mut cache = self.cache.lock().unwrap();
         let mut sampler = LogitsSampler::new(params.seed);
         let mut all_tokens = prompt_tokens.clone();
 
         let input = Tensor::new(prompt_tokens.as_slice(), &self.device)?.unsqueeze(0)?;
-        let mut logits = self.model.forward(&input, 0, &mut cache)?;
+        let (mut logits, reused_prefix_tokens) =
+            self.model.prefill_cached(&input, &mut cache)?;
         let mut completion_tokens = 0usize;
 
-        tracing::info!("Finished prefill, input token count: {} ", all_tokens.len());
+        tracing::info!(
+            "Finished prefill, prompt tokens: {}, reused prefix tokens: {}",
+            all_tokens.len(),
+            reused_prefix_tokens
+        );
 
         for index_pos in (prompt_len..).take(params.max_tokens) {
             let seq_len = logits.dim(1)?;
@@ -116,6 +125,7 @@ impl Engine {
         Ok(GenerationStats {
             prompt_tokens: prompt_len,
             completion_tokens,
+            reused_prefix_tokens,
         })
     }
 }
@@ -323,6 +333,39 @@ pub(crate) mod tests {
 
         assert!(stats.prompt_tokens > 0);
         assert!(stats.completion_tokens <= 4);
+    }
+
+    #[test]
+    fn second_identical_prompt_reuses_prefix_and_is_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture_model(dir.path());
+        let engine = Engine::load(dir.path()).unwrap();
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let params = crate::sampling::SamplingParams {
+            max_tokens: 4,
+            seed: 7,
+            temperature: 0.0,
+            ..Default::default()
+        };
+
+        let mut first = String::new();
+        let stats1 = engine
+            .generate(&messages, &params, |tok| first.push_str(tok))
+            .unwrap();
+        // Cold cache: the first call computes the whole prompt.
+        assert_eq!(stats1.reused_prefix_tokens, 0);
+
+        let mut second = String::new();
+        let stats2 = engine
+            .generate(&messages, &params, |tok| second.push_str(tok))
+            .unwrap();
+        // Second identical prompt reuses at least one cached block, and output is unchanged.
+        assert!(stats2.reused_prefix_tokens > 0);
+        assert_eq!(first, second);
+        assert_eq!(stats2.prompt_tokens, stats1.prompt_tokens);
     }
 
     #[test]

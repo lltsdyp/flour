@@ -211,6 +211,7 @@ mod tests {
         let stats = GenerationStats {
             prompt_tokens: 3,
             completion_tokens: 2,
+            reused_prefix_tokens: 0,
         };
         let resp = ChatCompletionResponse::new("flour".into(), "hello".into(), &stats);
         let json = serde_json::to_value(&resp).unwrap();
