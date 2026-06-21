@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use candle_core::{DType, Device, Result, Tensor};
 
 use super::paged::{BlockAllocator, BlockTable, PagedKvPool};
+use super::prefix::{block_hash, PrefixRegistry, PREFIX_HASH_SEED};
 use super::Config;
 
 const BLOCK_SIZE: usize = 16;
@@ -12,6 +13,7 @@ pub struct KvCache {
     pool: PagedKvPool,
     allocator: BlockAllocator,
     table: BlockTable,
+    registry: PrefixRegistry,
 }
 
 impl KvCache {
@@ -32,6 +34,7 @@ impl KvCache {
             pool,
             allocator,
             table,
+            registry: PrefixRegistry::new(),
         })
     }
 
@@ -88,6 +91,80 @@ impl KvCache {
             blocks.push(self.pool.block_view(layer_idx, start_slot, n)?);
         }
         Ok(blocks)
+    }
+
+    /// Drop the current sequence's references and start an empty sequence. Registry-owned
+    /// blocks (refcount > 1) survive; sequence-only blocks return to the free list.
+    pub fn reset_sequence(&mut self) {
+        let blocks: Vec<usize> = self.table.blocks().to_vec();
+        for block in blocks {
+            self.allocator.decref(block);
+        }
+        self.table.clear();
+    }
+
+    /// Reuse cached full blocks that form a prefix of `token_ids`, pushing them into the
+    /// current (just-reset) sequence. Returns the number of tokens served from cache (a
+    /// multiple of `block_size`). Always leaves at least one block unmatched so the caller has
+    /// a suffix to run — guaranteeing last-position logits.
+    pub fn match_prefix(&mut self, token_ids: &[u32]) -> usize {
+        let bs = self.table.block_size();
+        let num_full = token_ids.len() / bs;
+        // If the prompt is exactly block-aligned, never reuse its final full block, or the
+        // suffix would be empty.
+        let max_reusable = if token_ids.len() % bs == 0 {
+            num_full.saturating_sub(1)
+        } else {
+            num_full
+        };
+
+        let mut parent = PREFIX_HASH_SEED;
+        let mut matched = 0usize;
+        for b in 0..max_reusable {
+            let chunk = &token_ids[b * bs..(b + 1) * bs];
+            let h = block_hash(parent, chunk);
+            match self.registry.get(h, chunk) {
+                Some(block_id) => {
+                    self.allocator.incref(block_id);
+                    self.table.push_block(block_id);
+                    matched += bs;
+                    parent = h;
+                }
+                None => break,
+            }
+        }
+        self.table.advance(matched);
+        matched
+    }
+
+    /// Register every full block of the just-completed prefill so later sequences can reuse it.
+    /// `token_ids` is the entire prompt (reused prefix + freshly computed suffix). Blocks
+    /// already in the registry are skipped (their reference is already held).
+    pub fn register_prefix(&mut self, token_ids: &[u32]) {
+        let bs = self.table.block_size();
+        let num_full = token_ids.len() / bs;
+        let mut parent = PREFIX_HASH_SEED;
+        for b in 0..num_full {
+            let chunk = &token_ids[b * bs..(b + 1) * bs];
+            let h = block_hash(parent, chunk);
+            if !self.registry.contains(h) {
+                let block_id = self.table.block_at(b);
+                self.allocator.incref(block_id); // registry takes its own reference
+                self.registry.insert(h, chunk.to_vec(), block_id);
+            }
+            parent = h;
+        }
+    }
+
+    /// Drop all cached prefixes. The live sequence's blocks keep their sequence references, so
+    /// the in-flight request is unaffected; only future reuse is disabled until re-registered.
+    pub fn clear_prefix_cache(&mut self) {
+        self.registry.clear();
+    }
+
+    #[cfg(test)]
+    pub fn free_blocks(&self) -> usize {
+        self.allocator.num_free()
     }
 }
 
@@ -179,6 +256,33 @@ impl Cache {
     /// The full live KV for a layer, returned block-by-block in logical order.
     pub fn kv_blocks(&self, layer_idx: usize) -> Result<Vec<(Tensor, Tensor)>> {
         self.kvs.gather_blocks(layer_idx)
+    }
+
+    /// Begin a fresh sequence, releasing the previous sequence's non-cached blocks. The prefix
+    /// registry persists across sequences (this is what enables cross-request reuse).
+    pub fn reset_sequence(&mut self) {
+        self.kvs.reset_sequence();
+    }
+
+    /// Reuse the longest cached block-aligned prefix of `token_ids`; returns matched token
+    /// count. Call on a freshly reset sequence, before `allocate_kv`/`write_kv` for the suffix.
+    pub fn match_prefix(&mut self, token_ids: &[u32]) -> usize {
+        self.kvs.match_prefix(token_ids)
+    }
+
+    /// Register the completed prefill's full blocks for future reuse.
+    pub fn register_prefix(&mut self, token_ids: &[u32]) {
+        self.kvs.register_prefix(token_ids);
+    }
+
+    /// Drop all cached prefixes (escape hatch; does not disturb the live sequence).
+    pub fn clear_prefix_cache(&mut self) {
+        self.kvs.clear_prefix_cache();
+    }
+
+    #[cfg(test)]
+    pub fn free_blocks_for_test(&self) -> usize {
+        self.kvs.free_blocks()
     }
 }
 
@@ -309,5 +413,105 @@ mod tests {
         let got: Vec<f32> = blocks[0].0.flatten_all().unwrap().to_vec1().unwrap();
         let want: Vec<f32> = k.flatten_all().unwrap().to_vec1().unwrap();
         assert_eq!(got, want);
+    }
+
+    fn prefix_config() -> Config {
+        // max_seq_len 64 with BLOCK_SIZE 16 => 4 physical blocks.
+        Config {
+            max_seq_len: 64,
+            ..test_config()
+        }
+    }
+
+    /// Fill the live suffix [matched..matched+seq_len) of layer 0 with deterministic KV so the
+    /// pool has real, distinguishable contents to reuse.
+    fn write_zeros_for_current_batch(cache: &mut Cache, seq_len: usize) {
+        let k = candle_core::Tensor::zeros(
+            (1, prefix_config().num_key_value_heads, seq_len, prefix_config().head_dim),
+            candle_core::DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
+        cache.write_kv(0, &k, &k).unwrap();
+    }
+
+    #[test]
+    fn match_prefix_is_empty_before_anything_is_registered() {
+        let mut cache = Cache::new(&prefix_config(), &Device::Cpu).unwrap();
+        let ids: Vec<u32> = (0..40).collect(); // 2 full blocks + partial
+        cache.reset_sequence();
+        assert_eq!(cache.match_prefix(&ids), 0);
+    }
+
+    #[test]
+    fn register_then_match_reuses_full_blocks_and_leaves_a_suffix() {
+        let cfg = prefix_config();
+        let mut cache = Cache::new(&cfg, &Device::Cpu).unwrap();
+        let ids: Vec<u32> = (0..40).collect(); // 40 tokens => 2 full blocks (32) + 8 partial
+
+        // First request: nothing cached, allocate + fill all 40, then register full blocks.
+        cache.reset_sequence();
+        assert_eq!(cache.match_prefix(&ids), 0);
+        cache.allocate_kv(40).unwrap();
+        write_zeros_for_current_batch(&mut cache, 40);
+        cache.register_prefix(&ids);
+
+        // Second request, identical prompt: the 2 full blocks (32 tokens) are reused; the partial
+        // tail (8 tokens) stays as suffix.
+        cache.reset_sequence();
+        let matched = cache.match_prefix(&ids);
+        assert_eq!(matched, 32);
+    }
+
+    #[test]
+    fn match_prefix_leaves_last_block_when_prompt_is_block_aligned() {
+        let cfg = prefix_config();
+        let mut cache = Cache::new(&cfg, &Device::Cpu).unwrap();
+        let ids: Vec<u32> = (0..32).collect(); // exactly 2 full blocks, no partial tail
+
+        cache.reset_sequence();
+        cache.match_prefix(&ids);
+        cache.allocate_kv(32).unwrap();
+        write_zeros_for_current_batch(&mut cache, 32);
+        cache.register_prefix(&ids);
+
+        cache.reset_sequence();
+        // Block-aligned prompt: at most num_full - 1 blocks reused so a suffix always remains.
+        assert_eq!(cache.match_prefix(&ids), 16);
+    }
+
+    #[test]
+    fn reset_sequence_frees_unregistered_blocks_but_keeps_registered_ones() {
+        let cfg = prefix_config();
+        let mut cache = Cache::new(&cfg, &Device::Cpu).unwrap();
+        let ids: Vec<u32> = (0..40).collect();
+
+        cache.reset_sequence();
+        cache.match_prefix(&ids);
+        cache.allocate_kv(40).unwrap(); // 3 blocks: 2 full + 1 partial
+        write_zeros_for_current_batch(&mut cache, 40);
+        cache.register_prefix(&ids);
+
+        let free_after_first = cache.free_blocks_for_test();
+        cache.reset_sequence();
+        // The partial 3rd block is freed; the 2 registered blocks stay live.
+        assert_eq!(cache.free_blocks_for_test(), free_after_first + 1);
+    }
+
+    #[test]
+    fn clear_prefix_cache_disables_reuse() {
+        let cfg = prefix_config();
+        let mut cache = Cache::new(&cfg, &Device::Cpu).unwrap();
+        let ids: Vec<u32> = (0..40).collect();
+
+        cache.reset_sequence();
+        cache.match_prefix(&ids);
+        cache.allocate_kv(40).unwrap();
+        write_zeros_for_current_batch(&mut cache, 40);
+        cache.register_prefix(&ids);
+
+        cache.clear_prefix_cache();
+        cache.reset_sequence();
+        assert_eq!(cache.match_prefix(&ids), 0);
     }
 }
