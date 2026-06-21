@@ -63,11 +63,17 @@ mod tests {
     #[test]
     fn block_hash_is_deterministic_and_parent_sensitive() {
         let toks = [1u32, 2, 3];
-        assert_eq!(block_hash(PREFIX_HASH_SEED, &toks), block_hash(PREFIX_HASH_SEED, &toks));
+        assert_eq!(
+            block_hash(PREFIX_HASH_SEED, &toks),
+            block_hash(PREFIX_HASH_SEED, &toks)
+        );
         // Different parent => different child hash (chaining).
         assert_ne!(block_hash(PREFIX_HASH_SEED, &toks), block_hash(42, &toks));
         // Different tokens => different hash.
-        assert_ne!(block_hash(PREFIX_HASH_SEED, &toks), block_hash(PREFIX_HASH_SEED, &[1, 2, 4]));
+        assert_ne!(
+            block_hash(PREFIX_HASH_SEED, &toks),
+            block_hash(PREFIX_HASH_SEED, &[1, 2, 4])
+        );
     }
 
     #[test]
@@ -82,7 +88,10 @@ mod tests {
         // Same hash but mismatched tokens (simulated collision) -> miss, not a wrong reuse.
         assert_eq!(reg.get(h, &[9, 9]), None);
         // Unknown hash -> miss.
-        assert_eq!(reg.get(block_hash(PREFIX_HASH_SEED, &[3, 4]), &[3, 4]), None);
+        assert_eq!(
+            reg.get(block_hash(PREFIX_HASH_SEED, &[3, 4]), &[3, 4]),
+            None
+        );
 
         reg.clear();
         assert!(!reg.contains(h));

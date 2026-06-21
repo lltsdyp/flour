@@ -30,7 +30,10 @@ impl BlockAllocator {
 
     /// Drop one reference; returns `true` if the block hit zero references and was freed.
     pub fn decref(&mut self, block_id: usize) -> bool {
-        debug_assert!(self.ref_counts[block_id] > 0, "decref of unreferenced block");
+        debug_assert!(
+            self.ref_counts[block_id] > 0,
+            "decref of unreferenced block"
+        );
         self.ref_counts[block_id] -= 1;
         if self.ref_counts[block_id] == 0 {
             self.free.push(block_id);

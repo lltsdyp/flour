@@ -88,8 +88,7 @@ impl Engine {
         let mut all_tokens = prompt_tokens.clone();
 
         let input = Tensor::new(prompt_tokens.as_slice(), &self.device)?.unsqueeze(0)?;
-        let (mut logits, reused_prefix_tokens) =
-            self.model.prefill_cached(&input, &mut cache)?;
+        let (mut logits, reused_prefix_tokens) = self.model.prefill_cached(&input, &mut cache)?;
         let mut completion_tokens = 0usize;
 
         tracing::info!(

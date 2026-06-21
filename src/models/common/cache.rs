@@ -112,7 +112,7 @@ impl KvCache {
         let num_full = token_ids.len() / bs;
         // If the prompt is exactly block-aligned, never reuse its final full block, or the
         // suffix would be empty.
-        let max_reusable = if token_ids.len() % bs == 0 {
+        let max_reusable = if token_ids.len().is_multiple_of(bs) {
             num_full.saturating_sub(1)
         } else {
             num_full
@@ -430,7 +430,12 @@ mod tests {
     /// pool has real, distinguishable contents to reuse.
     fn write_zeros_for_current_batch(cache: &mut Cache, seq_len: usize) {
         let k = candle_core::Tensor::zeros(
-            (1, prefix_config().num_key_value_heads, seq_len, prefix_config().head_dim),
+            (
+                1,
+                prefix_config().num_key_value_heads,
+                seq_len,
+                prefix_config().head_dim,
+            ),
             candle_core::DType::F32,
             &Device::Cpu,
         )
