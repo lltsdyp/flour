@@ -87,6 +87,22 @@ impl BlockTable {
         self.blocks.push(block_id);
     }
 
+    /// Physical block ids currently mapped, in logical order.
+    pub fn blocks(&self) -> &[usize] {
+        &self.blocks
+    }
+
+    /// Physical block id for a logical block index.
+    pub fn block_at(&self, logical_block: usize) -> usize {
+        self.blocks[logical_block]
+    }
+
+    /// Drop all blocks and reset the live length, keeping the configured block size.
+    pub fn clear(&mut self) {
+        self.blocks.clear();
+        self.len = 0;
+    }
+
     pub fn advance(&mut self, n: usize) {
         self.len += n;
     }
@@ -269,5 +285,22 @@ mod tests {
         table.advance(3);
         assert_eq!(table.len(), 3);
         assert_eq!(table.slots(0, 3), vec![10u32, 11, 6]);
+    }
+
+    #[test]
+    fn block_table_exposes_blocks_and_clears() {
+        let mut table = BlockTable::new(2);
+        table.push_block(5);
+        table.push_block(3);
+        table.advance(4);
+        assert_eq!(table.blocks(), &[5, 3]);
+        assert_eq!(table.block_at(0), 5);
+        assert_eq!(table.block_at(1), 3);
+
+        table.clear();
+        assert!(table.is_empty());
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.blocks(), &[] as &[usize]);
+        assert_eq!(table.block_size(), 2); // block_size preserved
     }
 }
