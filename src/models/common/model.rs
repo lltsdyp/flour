@@ -58,6 +58,31 @@ impl CausalLM {
         self.lm_head.forward(&x)
     }
 
+    /// Prefill that reuses any cached prefix. Matched leading blocks are read straight from the
+    /// KV pool (no recompute); only the unmatched suffix runs through the network. Returns the
+    /// suffix logits (final row = last prompt token) and how many prompt tokens were reused.
+    pub fn prefill_cached(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut Cache,
+    ) -> Result<(Tensor, usize)> {
+        let ids: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
+
+        cache.reset_sequence();
+        let matched = cache.match_prefix(&ids);
+
+        let suffix = &ids[matched..];
+        let suffix_ids = Tensor::from_vec(suffix.to_vec(), (1, suffix.len()), input_ids.device())?;
+
+        // `forward` allocates KV slots for the suffix, writes its K/V into fresh blocks, and
+        // runs paged attention over ALL live blocks (reused prefix + suffix). RoPE uses
+        // `index_pos = matched`, so the suffix sits at its true absolute positions.
+        let logits = self.forward(&suffix_ids, matched, cache)?;
+
+        cache.register_prefix(&ids);
+        Ok((logits, matched))
+    }
+
     pub fn config(&self) -> &Config {
         &self.cfg
     }
@@ -67,7 +92,7 @@ impl CausalLM {
 mod tests {
     use super::*;
     use crate::models::common::Config;
-    use candle_core::{DType, Device, Tensor};
+    use candle_core::{DType, Device, IndexOp, Tensor};
     use candle_nn::VarBuilder;
     use std::collections::HashMap;
 
@@ -184,5 +209,66 @@ mod tests {
         // No "lm_head.weight" tensor was provided, so loading only succeeds if
         // tie_word_embeddings correctly reused embed_tokens instead of fetching lm_head.
         assert_eq!(model.config().vocab_size, cfg.vocab_size);
+    }
+
+    fn prefix_test_config() -> Config {
+        Config {
+            max_seq_len: 64,
+            ..test_config()
+        }
+    }
+
+    #[test]
+    fn prefill_cached_with_cold_cache_matches_plain_forward() {
+        let cfg = prefix_test_config();
+        let model = CausalLM::load(make_vb(&cfg), cfg.clone()).unwrap();
+
+        // Plain forward over the whole prompt (reference).
+        let ids_vec: Vec<u32> = (0..20u32).map(|i| i % cfg.vocab_size as u32).collect();
+        let ids = Tensor::from_vec(ids_vec.clone(), (1, ids_vec.len()), &Device::Cpu).unwrap();
+        let mut ref_cache = super::super::Cache::new(&cfg, &Device::Cpu).unwrap();
+        let reference = model.forward(&ids, 0, &mut ref_cache).unwrap();
+        let ref_last: Vec<f32> = reference
+            .i((0, ids_vec.len() - 1)).unwrap()
+            .to_vec1().unwrap();
+
+        // Cold prefill_cached: nothing cached yet => no reuse, identical last-row logits.
+        let mut cache = super::super::Cache::new(&cfg, &Device::Cpu).unwrap();
+        let (logits, reused) = model.prefill_cached(&ids, &mut cache).unwrap();
+        assert_eq!(reused, 0);
+        let got_last: Vec<f32> = logits
+            .i((0, logits.dim(1).unwrap() - 1)).unwrap()
+            .to_vec1().unwrap();
+        for (a, b) in ref_last.iter().zip(got_last.iter()) {
+            assert!((a - b).abs() < 1e-4, "logit mismatch {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn prefill_cached_reuses_prefix_and_preserves_last_logits() {
+        let cfg = prefix_test_config();
+        let model = CausalLM::load(make_vb(&cfg), cfg.clone()).unwrap();
+
+        let ids_vec: Vec<u32> = (0..40u32).map(|i| i % cfg.vocab_size as u32).collect();
+        let ids = Tensor::from_vec(ids_vec.clone(), (1, ids_vec.len()), &Device::Cpu).unwrap();
+
+        // Reference: last-row logits from a cold cache.
+        let mut ref_cache = super::super::Cache::new(&cfg, &Device::Cpu).unwrap();
+        let (ref_logits, _) = model.prefill_cached(&ids, &mut ref_cache).unwrap();
+        let ref_last: Vec<f32> = ref_logits
+            .i((0, ref_logits.dim(1).unwrap() - 1)).unwrap()
+            .to_vec1().unwrap();
+
+        // Same cache, run the identical prompt again: prefix now reused, suffix shorter.
+        let (logits, reused) = model.prefill_cached(&ids, &mut ref_cache).unwrap();
+        assert!(reused > 0, "expected prefix reuse on the second identical prompt");
+        assert_eq!(logits.dim(1).unwrap(), ids_vec.len() - reused);
+
+        let got_last: Vec<f32> = logits
+            .i((0, logits.dim(1).unwrap() - 1)).unwrap()
+            .to_vec1().unwrap();
+        for (a, b) in ref_last.iter().zip(got_last.iter()) {
+            assert!((a - b).abs() < 1e-4, "reuse changed logits: {a} vs {b}");
+        }
     }
 }
