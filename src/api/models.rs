@@ -1,13 +1,19 @@
 use axum::extract::State;
 use axum::Json;
 
+use super::error::ApiError;
 use super::openai::{ModelObject, ModelsListResponse};
 use super::AppState;
 
-pub async fn list_models(State(state): State<AppState>) -> Json<ModelsListResponse> {
+pub async fn list_models(
+    State(state): State<AppState>,
+) -> Result<Json<ModelsListResponse>, ApiError> {
     tracing::info!("Received GET /chat/completions");
-    let engine = state.engine.lock().unwrap();
-    Json(ModelsListResponse {
+    let engine = state
+        .engine
+        .lock()
+        .map_err(|_| ApiError::Internal("engine mutex poisoned".into()))?;
+    Ok(Json(ModelsListResponse {
         object: "list".into(),
         data: vec![ModelObject {
             id: engine.model_id().to_string(),
@@ -15,7 +21,7 @@ pub async fn list_models(State(state): State<AppState>) -> Json<ModelsListRespon
             created: state.started_at,
             owned_by: "flour".into(),
         }],
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -40,7 +46,7 @@ mod tests {
             started_at: 0,
         };
 
-        let Json(resp) = list_models(State(state)).await;
+        let Json(resp) = list_models(State(state)).await.unwrap();
         assert_eq!(resp.object, "list");
         assert_eq!(resp.data.len(), 1);
         assert_eq!(resp.data[0].id, expected_id);

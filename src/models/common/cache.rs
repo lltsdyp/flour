@@ -219,15 +219,17 @@ impl Cache {
     /// the last `seq_len` kv columns; any earlier (already-cached) kv columns are always visible.
     pub fn causal_mask(&mut self, seq_len: usize, kv_seq_len: usize) -> Result<Tensor> {
         let key = (seq_len, kv_seq_len);
-        if !self.masks.contains_key(&key) {
-            let offset = kv_seq_len - seq_len;
-            let mask: Vec<u8> = (0..seq_len)
-                .flat_map(|i| (0..kv_seq_len).map(move |j| u8::from(j > i + offset)))
-                .collect();
-            let mask = Tensor::from_slice(&mask, (seq_len, kv_seq_len), &self.device)?;
-            self.masks.insert(key, mask);
+        if let Some(mask) = self.masks.get(&key) {
+            return Ok(mask.clone());
         }
-        Ok(self.masks.get(&key).unwrap().clone())
+
+        let offset = kv_seq_len - seq_len;
+        let data: Vec<u8> = (0..seq_len)
+            .flat_map(|i| (0..kv_seq_len).map(move |j| u8::from(j > i + offset)))
+            .collect();
+        let mask = Tensor::from_slice(&data, (seq_len, kv_seq_len), &self.device)?;
+        self.masks.insert(key, mask.clone());
+        Ok(mask)
     }
 
     pub fn allocate_kv(&mut self, seq_len: usize) -> Result<()> {

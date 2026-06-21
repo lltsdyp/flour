@@ -49,7 +49,7 @@ impl LogitsSampler {
         let mut probs = softmax(&scaled);
 
         let mut indices: Vec<usize> = (0..probs.len()).collect();
-        indices.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        indices.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
 
         if let Some(k) = params.top_k {
             for &idx in indices.iter().skip(k) {
@@ -73,7 +73,7 @@ impl LogitsSampler {
         }
 
         let sum: f32 = probs.iter().sum();
-        if sum <= 0.0 {
+        if !sum.is_finite() || sum <= 0.0 {
             return arg_max(logits);
         }
         for p in probs.iter_mut() {
@@ -96,7 +96,8 @@ fn arg_max(logits: &[f32]) -> u32 {
     logits
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .filter(|(_, value)| !value.is_nan())
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(idx, _)| idx as u32)
         .unwrap_or(0)
 }

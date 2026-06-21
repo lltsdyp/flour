@@ -26,13 +26,20 @@ pub async fn chat_completions(
     tracing::info!("Body: {:?}", req);
     let params: SamplingParams = (&req).into();
     let messages = req.messages.clone();
-    let model_id = state.engine.lock().unwrap().model_id().to_string();
+    let model_id = state
+        .engine
+        .lock()
+        .map_err(|_| ApiError::Internal("engine mutex poisoned".into()))?
+        .model_id()
+        .to_string();
 
     if req.stream.unwrap_or(false) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let engine = state.engine.clone();
-        let generation_handle = tokio::task::spawn_blocking(move || {
-            let engine = engine.lock().unwrap();
+        let generation_handle = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let engine = engine
+                .lock()
+                .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?;
             engine.generate(&messages, &params, |tok| {
                 let _ = tx.send(tok.to_string());
             })
@@ -44,17 +51,38 @@ pub async fn chat_completions(
 
         let stream = async_stream::stream! {
             let role = ChatCompletionChunk::role_chunk(&completion_id, created, &model_for_stream);
-            yield Ok::<_, std::convert::Infallible>(Event::default().data(serde_json::to_string(&role).unwrap()));
+            let role = match serde_json::to_string(&role) {
+                Ok(role) => role,
+                Err(err) => {
+                    tracing::error!("failed to serialize role chunk: {err}");
+                    return;
+                }
+            };
+            yield Ok::<_, std::convert::Infallible>(Event::default().data(role));
 
             while let Some(tok) = rx.recv().await {
                 let chunk = ChatCompletionChunk::delta_chunk(&completion_id, created, &model_for_stream, &tok);
-                yield Ok(Event::default().data(serde_json::to_string(&chunk).unwrap()));
+                let chunk = match serde_json::to_string(&chunk) {
+                    Ok(chunk) => chunk,
+                    Err(err) => {
+                        tracing::error!("failed to serialize delta chunk: {err}");
+                        return;
+                    }
+                };
+                yield Ok(Event::default().data(chunk));
             }
 
             match generation_handle.await {
                 Ok(Ok(_stats)) => {
                     let done = ChatCompletionChunk::finish_chunk(&completion_id, created, &model_for_stream);
-                    yield Ok(Event::default().data(serde_json::to_string(&done).unwrap()));
+                    let done = match serde_json::to_string(&done) {
+                        Ok(done) => done,
+                        Err(err) => {
+                            tracing::error!("failed to serialize finish chunk: {err}");
+                            return;
+                        }
+                    };
+                    yield Ok(Event::default().data(done));
                     yield Ok(Event::default().data("[DONE]"));
                 }
                 Ok(Err(err)) => {
@@ -72,7 +100,9 @@ pub async fn chat_completions(
     } else {
         let engine = state.engine.clone();
         let (text, stats) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let engine = engine.lock().unwrap();
+            let engine = engine
+                .lock()
+                .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?;
             let mut full = String::new();
             let stats = engine.generate(&messages, &params, |tok| full.push_str(tok))?;
             Ok((full, stats))

@@ -83,7 +83,10 @@ impl Engine {
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
         let prompt_len = prompt_tokens.len();
 
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine cache mutex poisoned"))?;
         let mut sampler = LogitsSampler::new(params.seed);
         let mut all_tokens = prompt_tokens.clone();
 

@@ -169,13 +169,18 @@ impl PagedKvPool {
         // (1, kv_heads, seq, head_dim) -> (kv_heads, seq, head_dim); slot axis already aligned.
         let kt = k.squeeze(0)?;
         let vt = v.squeeze(0)?;
-        for (i, &slot) in slots.iter().enumerate() {
-            let slot = slot as usize;
-            let k_tok = kt.narrow(1, i, 1)?; // (kv_heads, 1, head_dim)
-            let v_tok = vt.narrow(1, i, 1)?;
-            let ranges = [0..self.kv_heads, slot..slot + 1, 0..self.head_dim];
-            self.k_pools[layer_idx] = self.k_pools[layer_idx].slice_assign(&ranges, &k_tok)?;
-            self.v_pools[layer_idx] = self.v_pools[layer_idx].slice_assign(&ranges, &v_tok)?;
+        let k_pool = &self.k_pools[layer_idx];
+        let v_pool = &self.v_pools[layer_idx];
+        let mut i=0;
+        while i < slots.len() {
+            let mut n=1;
+            let start_slot = slots[i] as usize;
+            while i + n < slots.len() && i+n == start_slot+n {
+                n += 1;
+            }
+            k_pool.slice_set(&kt.narrow(1,i,n)?.contiguous()?,1,start_slot)?;
+            v_pool.slice_set(&vt.narrow(1, i, n)?.contiguous()?,1,start_slot)?;
+            i += n;
         }
         Ok(())
     }
