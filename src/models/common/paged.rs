@@ -1,9 +1,12 @@
 use candle_core::{DType, Device, Result, Tensor};
 
-/// Hands out and reclaims physical KV block ids from a free list.
+/// Hands out and reclaims physical KV block ids from a free list, tracking a reference
+/// count per block so registry-owned and sequence-owned references can coexist. A block is
+/// returned to the free list only when its last reference is dropped.
 #[derive(Debug)]
 pub struct BlockAllocator {
     free: Vec<usize>,
+    ref_counts: Vec<usize>,
 }
 
 impl BlockAllocator {
@@ -11,15 +14,34 @@ impl BlockAllocator {
         // Reverse so the first `allocate` returns block 0 (nicer for debugging).
         Self {
             free: (0..num_blocks).rev().collect(),
+            ref_counts: vec![0; num_blocks],
         }
     }
 
     pub fn allocate(&mut self) -> Option<usize> {
-        self.free.pop()
+        let id = self.free.pop()?;
+        self.ref_counts[id] = 1;
+        Some(id)
     }
 
-    pub fn free_block(&mut self, block_id: usize) {
-        self.free.push(block_id);
+    pub fn incref(&mut self, block_id: usize) {
+        self.ref_counts[block_id] += 1;
+    }
+
+    /// Drop one reference; returns `true` if the block hit zero references and was freed.
+    pub fn decref(&mut self, block_id: usize) -> bool {
+        debug_assert!(self.ref_counts[block_id] > 0, "decref of unreferenced block");
+        self.ref_counts[block_id] -= 1;
+        if self.ref_counts[block_id] == 0 {
+            self.free.push(block_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn ref_count(&self, block_id: usize) -> usize {
+        self.ref_counts[block_id]
     }
 
     pub fn num_free(&self) -> usize {
@@ -203,8 +225,30 @@ mod tests {
         let b = alloc.allocate().unwrap();
         assert_ne!(a, b);
         assert_eq!(alloc.allocate(), None);
-        alloc.free_block(a);
+        assert_eq!(alloc.decref(a), true);
         assert_eq!(alloc.num_free(), 1);
+        assert_eq!(alloc.allocate(), Some(a));
+    }
+
+    #[test]
+    fn allocator_refcounts_govern_when_a_block_is_freed() {
+        let mut alloc = BlockAllocator::new(2);
+        assert_eq!(alloc.num_free(), 2);
+
+        let a = alloc.allocate().unwrap();
+        assert_eq!(alloc.ref_count(a), 1);
+
+        // A second reference keeps the block live across one decref.
+        alloc.incref(a);
+        assert_eq!(alloc.ref_count(a), 2);
+        assert_eq!(alloc.decref(a), false); // still referenced
+        assert_eq!(alloc.num_free(), 1);
+
+        // Final decref frees it back to the pool.
+        assert_eq!(alloc.decref(a), true);
+        assert_eq!(alloc.ref_count(a), 0);
+        assert_eq!(alloc.num_free(), 2);
+        // Freed block can be hander out again.
         assert_eq!(alloc.allocate(), Some(a));
     }
 
