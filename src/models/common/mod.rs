@@ -4,6 +4,7 @@ pub mod config;
 pub mod mlp;
 pub mod model;
 pub mod paged;
+pub mod prefix;
 pub mod transformer;
 
 pub use attention::CausalSelfAttention;
