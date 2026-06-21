@@ -156,10 +156,13 @@ impl KvCache {
         }
     }
 
-    /// Drop all cached prefixes. The live sequence's blocks keep their sequence references, so
-    /// the in-flight request is unaffected; only future reuse is disabled until re-registered.
+    /// Drop all cached prefixes, releasing the registry's reference on each cached block. The
+    /// live sequence's own references are untouched, so an in-flight request is unaffected;
+    /// blocks referenced only by the registry return to the free list.
     pub fn clear_prefix_cache(&mut self) {
-        self.registry.clear();
+        for block_id in self.registry.drain_block_ids() {
+            self.allocator.decref(block_id);
+        }
     }
 
     #[cfg(test)]
@@ -511,6 +514,31 @@ mod tests {
         cache.register_prefix(&ids);
 
         cache.clear_prefix_cache();
+        cache.reset_sequence();
+        assert_eq!(cache.match_prefix(&ids), 0);
+    }
+
+    #[test]
+    fn clear_prefix_cache_releases_registry_only_blocks_to_the_pool() {
+        let cfg = prefix_config();
+        let mut cache = Cache::new(&cfg, &Device::Cpu).unwrap();
+        let ids: Vec<u32> = (0..40).collect(); // 2 full blocks registered + partial tail
+
+        cache.reset_sequence();
+        cache.match_prefix(&ids);
+        cache.allocate_kv(40).unwrap();
+        write_zeros_for_current_batch(&mut cache, 40);
+        cache.register_prefix(&ids); // blocks 0,1 held by registry (refcount 2)
+
+        // End the sequence: registered blocks drop to refcount 1 (registry only).
+        cache.reset_sequence();
+        let free_before = cache.free_blocks_for_test();
+
+        // Clearing the prefix cache must return the 2 registry-only blocks to the pool.
+        cache.clear_prefix_cache();
+        assert_eq!(cache.free_blocks_for_test(), free_before + 2);
+
+        // Reuse is also disabled afterwards.
         cache.reset_sequence();
         assert_eq!(cache.match_prefix(&ids), 0);
     }

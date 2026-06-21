@@ -48,6 +48,12 @@ impl PrefixRegistry {
     pub fn clear(&mut self) {
         self.entries.clear();
     }
+
+    /// Empty the registry, returning the physical block ids it had been holding so the caller
+    /// can release their registry references.
+    pub fn drain_block_ids(&mut self) -> Vec<usize> {
+        self.entries.drain().map(|(_, (_, id))| id).collect()
+    }
 }
 
 #[cfg(test)]
