@@ -11,10 +11,29 @@ use crate::models::{
 use crate::sampling::{apply_repeat_penalty, LogitsSampler, SamplingParams};
 use crate::tokenizer::{ChatMessage, ChatTemplate, Tokenizer};
 
+/// Why generation stopped. Maps to the OpenAI `finish_reason` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    /// Hit an EOS token or a configured stop sequence.
+    Stop,
+    /// Reached the `max_tokens` budget without stopping naturally.
+    Length,
+}
+
+impl FinishReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FinishReason::Stop => "stop",
+            FinishReason::Length => "length",
+        }
+    }
+}
+
 pub struct GenerationStats {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub reused_prefix_tokens: usize,
+    pub finish_reason: FinishReason,
 }
 
 pub struct Engine {
@@ -95,11 +114,15 @@ impl Engine {
         let mut completion_tokens = 0usize;
 
         tracing::info!(
-            "Finished prefill, prompt tokens: {}, reused prefix tokens: {}",
+            "Finished prefill, prompt tokens count: {}, reused prefix tokens count: {}",
             all_tokens.len(),
             reused_prefix_tokens
         );
 
+        // Defaults to Length: if the loop runs to the token budget without an EOS
+        // token or stop sequence, the completion was truncated.
+        let mut finish_reason = FinishReason::Length;
+        let mut generated = String::new();
         for index_pos in (prompt_len..).take(params.max_tokens) {
             let seq_len = logits.dim(1)?;
             let last = logits.i((0, seq_len - 1))?.to_dtype(DType::F32)?;
@@ -112,10 +135,30 @@ impl Engine {
 
             let next_token = sampler.sample(&logits_vec, params);
             if self.eos_token_id.is_eos(next_token) {
+                finish_reason = FinishReason::Stop;
                 break;
             }
 
             let piece = self.tokenizer.decode(&[next_token])?;
+
+            // Stop-sequence check: a stop string may span several tokens, so test it
+            // against the full decoded output. The stop text is counted as generated
+            // but not emitted to the caller.
+            if !params.stop.is_empty() {
+                let candidate = format!("{generated}{piece}");
+                if params
+                    .stop
+                    .iter()
+                    .any(|s| !s.is_empty() && candidate.ends_with(s.as_str()))
+                {
+                    all_tokens.push(next_token);
+                    completion_tokens += 1;
+                    finish_reason = FinishReason::Stop;
+                    break;
+                }
+            }
+
+            generated.push_str(&piece);
             on_token(&piece);
             all_tokens.push(next_token);
             completion_tokens += 1;
@@ -124,10 +167,15 @@ impl Engine {
             logits = self.model.forward(&next_input, index_pos, &mut cache)?;
         }
 
+        tracing::info!(
+            "Generate finished, generated tokens count:{}",
+            completion_tokens
+        );
         Ok(GenerationStats {
             prompt_tokens: prompt_len,
             completion_tokens,
             reused_prefix_tokens,
+            finish_reason,
         })
     }
 }
@@ -395,5 +443,72 @@ pub(crate) mod tests {
             .generate(&messages, &params, |tok| b.push_str(tok))
             .unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn exhausting_max_tokens_reports_finish_reason_length() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture_model(dir.path());
+        let engine = Engine::load(dir.path()).unwrap();
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let params = crate::sampling::SamplingParams {
+            max_tokens: 3,
+            seed: 5,
+            temperature: 0.0,
+            ..Default::default()
+        };
+
+        let stats = engine.generate(&messages, &params, |_| {}).unwrap();
+        // With no EOS or stop sequence hit, generation runs to the token budget.
+        assert_eq!(stats.completion_tokens, 3);
+        assert_eq!(stats.finish_reason, FinishReason::Length);
+    }
+
+    #[test]
+    fn stop_sequence_halts_generation_with_finish_reason_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture_model(dir.path());
+        let engine = Engine::load(dir.path()).unwrap();
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let base = crate::sampling::SamplingParams {
+            max_tokens: 8,
+            seed: 5,
+            temperature: 0.0,
+            ..Default::default()
+        };
+
+        // Capture the deterministic first emitted piece, then make it a stop sequence.
+        let mut first_piece = String::new();
+        engine
+            .generate(&messages, &base, |tok| {
+                if first_piece.is_empty() {
+                    first_piece.push_str(tok);
+                }
+            })
+            .unwrap();
+        assert!(
+            !first_piece.is_empty(),
+            "model emitted no tokens to stop on"
+        );
+
+        let params = crate::sampling::SamplingParams {
+            stop: vec![first_piece.clone()],
+            ..base
+        };
+        let mut emitted = String::new();
+        let stats = engine
+            .generate(&messages, &params, |tok| emitted.push_str(tok))
+            .unwrap();
+
+        assert_eq!(stats.finish_reason, FinishReason::Stop);
+        // The stop sequence itself is not emitted to the caller.
+        assert!(!emitted.contains(&first_piece));
+        assert!(stats.completion_tokens < 8);
     }
 }

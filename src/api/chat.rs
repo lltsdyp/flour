@@ -4,7 +4,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use super::error::ApiError;
-use super::openai::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse};
+use super::openai::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Usage};
 use super::AppState;
 use crate::sampling::SamplingParams;
 
@@ -25,6 +25,7 @@ pub async fn chat_completions(
     }
     tracing::info!("Body: {:?}", req);
     let params: SamplingParams = (&req).into();
+    let include_usage = req.wants_usage();
     let messages = req.messages.clone();
     let model_id = state
         .engine
@@ -73,8 +74,8 @@ pub async fn chat_completions(
             }
 
             match generation_handle.await {
-                Ok(Ok(_stats)) => {
-                    let done = ChatCompletionChunk::finish_chunk(&completion_id, created, &model_for_stream);
+                Ok(Ok(stats)) => {
+                    let done = ChatCompletionChunk::finish_chunk(&completion_id, created, &model_for_stream, stats.finish_reason.as_str());
                     let done = match serde_json::to_string(&done) {
                         Ok(done) => done,
                         Err(err) => {
@@ -83,6 +84,25 @@ pub async fn chat_completions(
                         }
                     };
                     yield Ok(Event::default().data(done));
+
+                    // Per OpenAI's stream_options.include_usage, follow the finish chunk
+                    // with a usage-only chunk so clients can read token counts mid-stream.
+                    if include_usage {
+                        let usage = Usage {
+                            prompt_tokens: stats.prompt_tokens,
+                            completion_tokens: stats.completion_tokens,
+                            total_tokens: stats.prompt_tokens + stats.completion_tokens,
+                        };
+                        let usage_chunk = ChatCompletionChunk::usage_chunk(&completion_id, created, &model_for_stream, usage);
+                        match serde_json::to_string(&usage_chunk) {
+                            Ok(usage_chunk) => yield Ok(Event::default().data(usage_chunk)),
+                            Err(err) => {
+                                tracing::error!("failed to serialize usage chunk: {err}");
+                                return;
+                            }
+                        }
+                    }
+
                     yield Ok(Event::default().data("[DONE]"));
                 }
                 Ok(Err(err)) => {

@@ -10,6 +10,9 @@ pub struct SamplingParams {
     pub repeat_penalty: f32,
     pub repeat_last_n: usize,
     pub seed: u64,
+    /// Stop sequences: generation halts (with finish_reason "stop") once the
+    /// decoded output ends with any of these strings. Empty = no extra stops.
+    pub stop: Vec<String>,
 }
 
 impl Default for SamplingParams {
@@ -22,6 +25,7 @@ impl Default for SamplingParams {
             repeat_penalty: 1.1,
             repeat_last_n: 64,
             seed: rand::random(),
+            stop: Vec::new(),
         }
     }
 }
@@ -141,6 +145,7 @@ mod tests {
             repeat_penalty: 1.0,
             repeat_last_n: 64,
             seed: 42,
+            stop: Vec::new(),
         }
     }
 
