@@ -180,7 +180,7 @@ mod tests {
     fn forward_prefill_returns_logits_for_every_position() {
         let cfg = test_config();
         let model = CausalLM::load(make_vb(&cfg), cfg.clone()).unwrap();
-        let mut cache = super::super::Cache::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = super::super::Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
         let ids = Tensor::from_vec(vec![1u32, 2, 3], (1, 3), &Device::Cpu).unwrap();
         let logits = model.forward(&ids, 0, &mut cache).unwrap();
         assert_eq!(logits.dims(), &[1, 3, cfg.vocab_size]);
@@ -190,7 +190,7 @@ mod tests {
     fn forward_decode_step_returns_logits_for_one_position() {
         let cfg = test_config();
         let model = CausalLM::load(make_vb(&cfg), cfg.clone()).unwrap();
-        let mut cache = super::super::Cache::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = super::super::Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
         let prefill = Tensor::from_vec(vec![1u32, 2, 3], (1, 3), &Device::Cpu).unwrap();
         model.forward(&prefill, 0, &mut cache).unwrap();
         let step = Tensor::from_vec(vec![4u32], (1, 1), &Device::Cpu).unwrap();
@@ -222,7 +222,7 @@ mod tests {
         // Plain forward over the whole prompt (reference).
         let ids_vec: Vec<u32> = (0..20u32).map(|i| i % cfg.vocab_size as u32).collect();
         let ids = Tensor::from_vec(ids_vec.clone(), (1, ids_vec.len()), &Device::Cpu).unwrap();
-        let mut ref_cache = super::super::Cache::new(&cfg, &Device::Cpu).unwrap();
+        let mut ref_cache = super::super::Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
         let reference = model.forward(&ids, 0, &mut ref_cache).unwrap();
         let ref_last: Vec<f32> = reference
             .i((0, ids_vec.len() - 1))
@@ -231,7 +231,7 @@ mod tests {
             .unwrap();
 
         // Cold prefill_cached: nothing cached yet => no reuse, identical last-row logits.
-        let mut cache = super::super::Cache::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = super::super::Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
         let (logits, reused) = model.prefill_cached(&ids, &mut cache).unwrap();
         assert_eq!(reused, 0);
         let got_last: Vec<f32> = logits
@@ -253,7 +253,7 @@ mod tests {
         let ids = Tensor::from_vec(ids_vec.clone(), (1, ids_vec.len()), &Device::Cpu).unwrap();
 
         // Reference: last-row logits from a cold cache.
-        let mut ref_cache = super::super::Cache::new(&cfg, &Device::Cpu).unwrap();
+        let mut ref_cache = super::super::Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
         let (ref_logits, _) = model.prefill_cached(&ids, &mut ref_cache).unwrap();
         let ref_last: Vec<f32> = ref_logits
             .i((0, ref_logits.dim(1).unwrap() - 1))

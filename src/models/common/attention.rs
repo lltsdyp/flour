@@ -184,7 +184,7 @@ mod tests {
     fn forward_preserves_shape_prefill() {
         let cfg = test_config(false, false);
         let attn = CausalSelfAttention::load(make_vb(&cfg), &cfg).unwrap();
-        let mut cache = super::super::Cache::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = super::super::Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
         let x = make_tensor(&[1, 5, cfg.hidden_size], 100);
         cache.allocate_kv(5).unwrap();
         let y = attn.forward(&x, 0, 0, &mut cache).unwrap();
@@ -195,7 +195,7 @@ mod tests {
     fn forward_works_with_qkv_bias_and_qk_norm() {
         let cfg = test_config(true, true);
         let attn = CausalSelfAttention::load(make_vb(&cfg), &cfg).unwrap();
-        let mut cache = super::super::Cache::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = super::super::Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
         let x = make_tensor(&[1, 5, cfg.hidden_size], 101);
         cache.allocate_kv(5).unwrap();
         let y = attn.forward(&x, 0, 0, &mut cache).unwrap();
@@ -206,7 +206,7 @@ mod tests {
     fn forward_single_token_decode_step_after_prefill() {
         let cfg = test_config(false, false);
         let attn = CausalSelfAttention::load(make_vb(&cfg), &cfg).unwrap();
-        let mut cache = super::super::Cache::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = super::super::Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
         let prefill = make_tensor(&[1, 3, cfg.hidden_size], 102);
         cache.allocate_kv(3).unwrap();
         attn.forward(&prefill, 0, 0, &mut cache).unwrap();

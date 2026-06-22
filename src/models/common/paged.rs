@@ -140,21 +140,14 @@ impl PagedKvPool {
         num_slots: usize,
         kv_heads: usize,
         head_dim: usize,
+        dtype: DType,
         device: &Device,
     ) -> Result<Self> {
         let mut k_pools = Vec::with_capacity(num_layers);
         let mut v_pools = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            k_pools.push(Tensor::zeros(
-                (kv_heads, num_slots, head_dim),
-                DType::F32,
-                device,
-            )?);
-            v_pools.push(Tensor::zeros(
-                (kv_heads, num_slots, head_dim),
-                DType::F32,
-                device,
-            )?);
+            k_pools.push(Tensor::zeros((kv_heads, num_slots, head_dim), dtype, device)?);
+            v_pools.push(Tensor::zeros((kv_heads, num_slots, head_dim), dtype, device)?);
         }
         Ok(Self {
             k_pools,
@@ -224,7 +217,7 @@ mod tests {
     fn paged_pool_write_then_gather_round_trips() {
         // 1 layer, 4 slots, 1 kv head, head_dim 2.
         let dev = Device::Cpu;
-        let mut pool = PagedKvPool::new(1, 4, 1, 2, &dev).unwrap();
+        let mut pool = PagedKvPool::new(1, 4, 1, 2, DType::F32, &dev).unwrap();
 
         // Two tokens written to slots 2 and 0 (deliberately out of order).
         // k shape: (1, kv_heads=1, seq=2, head_dim=2)

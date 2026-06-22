@@ -11,6 +11,32 @@ use crate::models::{
 use crate::sampling::{apply_repeat_penalty, LogitsSampler, SamplingParams};
 use crate::tokenizer::{ChatMessage, ChatTemplate, Tokenizer};
 
+/// Parse a dtype name into a `DType`. Accepts both short forms (`f32`, `bf16`, `f16`) and the
+/// torch names found in `config.json` (`float32`, `bfloat16`, `float16`), case-insensitively.
+pub fn parse_dtype(s: &str) -> anyhow::Result<DType> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "f32" | "float32" => Ok(DType::F32),
+        "bf16" | "bfloat16" => Ok(DType::BF16),
+        "f16" | "float16" => Ok(DType::F16),
+        other => anyhow::bail!("unsupported dtype {other:?}; expected one of f32, bf16, f16"),
+    }
+}
+
+/// Decide which dtype to load the model in. An explicit override always wins; otherwise fall back
+/// to the model's `torch_dtype` from `config.json`, and finally to f32 if that is absent.
+fn resolve_dtype(
+    dtype_override: Option<DType>,
+    raw: &serde_json::Value,
+) -> anyhow::Result<DType> {
+    if let Some(dtype) = dtype_override {
+        return Ok(dtype);
+    }
+    match raw.get("torch_dtype").and_then(|v| v.as_str()) {
+        Some(name) => parse_dtype(name),
+        None => Ok(DType::F32),
+    }
+}
+
 /// Why generation stopped. Maps to the OpenAI `finish_reason` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishReason {
@@ -47,7 +73,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn load(model_dir: &Path) -> anyhow::Result<Self> {
+    pub fn load(model_dir: &Path, dtype_override: Option<DType>) -> anyhow::Result<Self> {
         let config_path = model_dir.join("config.json");
         let raw: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(&config_path)
@@ -56,10 +82,13 @@ impl Engine {
         let family = models::detect_family(&raw)?;
         let cfg = models::load_config(family, &raw)?;
 
+        let dtype = resolve_dtype(dtype_override, &raw)?;
+        tracing::info!("using dtype {dtype:?}");
+
         let device = Device::Cpu;
-        let vb = load_var_builder(model_dir, DType::F32, &device)?;
+        let vb = load_var_builder(model_dir, dtype, &device)?;
         let model = CausalLM::load(vb, cfg.clone())?;
-        let cache = std::sync::Mutex::new(Cache::new(&cfg, &device)?);
+        let cache = std::sync::Mutex::new(Cache::new(&cfg, dtype, &device)?);
 
         let tokenizer = Tokenizer::from_file(&model_dir.join("tokenizer.json"))?;
         let chat_template = ChatTemplate::for_family(family);
@@ -186,6 +215,29 @@ pub(crate) mod tests {
     use crate::tokenizer::ChatMessage;
     use candle_core::{DType, Device, Tensor};
     use std::collections::HashMap;
+
+    #[test]
+    fn parse_dtype_accepts_short_and_torch_names() {
+        assert_eq!(parse_dtype("f32").unwrap(), DType::F32);
+        assert_eq!(parse_dtype("float32").unwrap(), DType::F32);
+        assert_eq!(parse_dtype("bf16").unwrap(), DType::BF16);
+        assert_eq!(parse_dtype("BFloat16").unwrap(), DType::BF16);
+        assert_eq!(parse_dtype("f16").unwrap(), DType::F16);
+        assert_eq!(parse_dtype("float16").unwrap(), DType::F16);
+        assert!(parse_dtype("int8").is_err());
+    }
+
+    #[test]
+    fn resolve_dtype_prefers_override_then_config() {
+        let cfg: serde_json::Value = serde_json::json!({ "torch_dtype": "bfloat16" });
+        // Explicit override wins over config.
+        assert_eq!(resolve_dtype(Some(DType::F16), &cfg).unwrap(), DType::F16);
+        // Otherwise fall back to config's torch_dtype.
+        assert_eq!(resolve_dtype(None, &cfg).unwrap(), DType::BF16);
+        // Missing torch_dtype defaults to f32.
+        let empty = serde_json::json!({});
+        assert_eq!(resolve_dtype(None, &empty).unwrap(), DType::F32);
+    }
 
     pub(crate) fn fixture_dir_for_external_use() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -360,7 +412,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_fixture_model(dir.path());
 
-        let engine = Engine::load(dir.path()).unwrap();
+        let engine = Engine::load(dir.path(), None).unwrap();
         assert_eq!(
             engine.model_id(),
             dir.path().file_name().unwrap().to_string_lossy()
@@ -389,7 +441,7 @@ pub(crate) mod tests {
     fn second_identical_prompt_reuses_prefix_and_is_deterministic() {
         let dir = tempfile::tempdir().unwrap();
         write_fixture_model(dir.path());
-        let engine = Engine::load(dir.path()).unwrap();
+        let engine = Engine::load(dir.path(), None).unwrap();
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "hi".into(),
@@ -422,7 +474,7 @@ pub(crate) mod tests {
     fn generate_is_deterministic_for_a_fixed_seed() {
         let dir = tempfile::tempdir().unwrap();
         write_fixture_model(dir.path());
-        let engine = Engine::load(dir.path()).unwrap();
+        let engine = Engine::load(dir.path(), None).unwrap();
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "hi".into(),
@@ -449,7 +501,7 @@ pub(crate) mod tests {
     fn exhausting_max_tokens_reports_finish_reason_length() {
         let dir = tempfile::tempdir().unwrap();
         write_fixture_model(dir.path());
-        let engine = Engine::load(dir.path()).unwrap();
+        let engine = Engine::load(dir.path(), None).unwrap();
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "hi".into(),
@@ -471,7 +523,7 @@ pub(crate) mod tests {
     fn stop_sequence_halts_generation_with_finish_reason_stop() {
         let dir = tempfile::tempdir().unwrap();
         write_fixture_model(dir.path());
-        let engine = Engine::load(dir.path()).unwrap();
+        let engine = Engine::load(dir.path(), None).unwrap();
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "hi".into(),

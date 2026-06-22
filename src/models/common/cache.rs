@@ -17,7 +17,7 @@ pub struct KvCache {
 }
 
 impl KvCache {
-    pub fn new(cfg: &Config, device: &Device) -> Result<Self> {
+    pub fn new(cfg: &Config, dtype: DType, device: &Device) -> Result<Self> {
         let num_blocks = cfg.max_seq_len.div_ceil(BLOCK_SIZE);
         let num_slots = num_blocks * BLOCK_SIZE;
         let allocator = BlockAllocator::new(num_blocks);
@@ -27,6 +27,7 @@ impl KvCache {
             num_slots,
             cfg.num_key_value_heads,
             cfg.head_dim,
+            dtype,
             device,
         )?;
 
@@ -182,7 +183,7 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub fn new(cfg: &Config, device: &Device) -> Result<Self> {
+    pub fn new(cfg: &Config, dtype: DType, device: &Device) -> Result<Self> {
         let half_dim = cfg.head_dim / 2;
         let theta: Vec<f32> = (0..half_dim)
             .map(|i| 1f32 / cfg.rope_theta.powf((2 * i) as f32 / cfg.head_dim as f32))
@@ -194,14 +195,16 @@ impl Cache {
             .reshape((cfg.max_seq_len, 1))?
             .matmul(&theta.reshape((1, half_dim))?)?;
 
-        let cos = idx_theta.cos()?.contiguous()?;
-        let sin = idx_theta.sin()?.contiguous()?;
+        // RoPE tables are computed in f32 for accuracy, then cast to the model dtype so
+        // `candle_nn::rotary_emb::rope` sees q/k/cos/sin all in the same dtype.
+        let cos = idx_theta.cos()?.to_dtype(dtype)?.contiguous()?;
+        let sin = idx_theta.sin()?.to_dtype(dtype)?.contiguous()?;
 
         Ok(Self {
             cos,
             sin,
             masks: HashMap::new(),
-            kvs: KvCache::new(cfg, device)?,
+            kvs: KvCache::new(cfg, dtype, device)?,
             max_seq_len: cfg.max_seq_len,
             device: device.clone(),
         })
@@ -318,14 +321,14 @@ mod tests {
 
     #[test]
     fn rope_tables_have_expected_shape() {
-        let cache = Cache::new(&test_config(), &Device::Cpu).unwrap();
+        let cache = Cache::new(&test_config(), DType::F32, &Device::Cpu).unwrap();
         let cos = cache.rope_cos(0, 5).unwrap();
         assert_eq!(cos.dims(), &[5, 2]); // head_dim/2 = 2
     }
 
     #[test]
     fn rope_tables_respect_index_pos_offset() {
-        let cache = Cache::new(&test_config(), &Device::Cpu).unwrap();
+        let cache = Cache::new(&test_config(), DType::F32, &Device::Cpu).unwrap();
         let cos_a = cache
             .rope_cos(0, 1)
             .unwrap()
@@ -345,7 +348,7 @@ mod tests {
 
     #[test]
     fn causal_mask_is_upper_triangular() {
-        let mut cache = Cache::new(&test_config(), &Device::Cpu).unwrap();
+        let mut cache = Cache::new(&test_config(), DType::F32, &Device::Cpu).unwrap();
         let mask = cache.causal_mask(3, 3).unwrap();
         let mask: Vec<u8> = mask.flatten_all().unwrap().to_vec1().unwrap();
         // row 0: only col 0 visible -> [0,1,1]; row 1: [0,0,1]; row 2: [0,0,0]
@@ -354,7 +357,7 @@ mod tests {
 
     #[test]
     fn causal_mask_pads_for_existing_kv_prefix() {
-        let mut cache = Cache::new(&test_config(), &Device::Cpu).unwrap();
+        let mut cache = Cache::new(&test_config(), DType::F32, &Device::Cpu).unwrap();
         // 1 new query position, 3 total kv positions (2 already cached) -> fully visible
         let mask = cache.causal_mask(1, 3).unwrap();
         let mask: Vec<u8> = mask.flatten_all().unwrap().to_vec1().unwrap();
@@ -368,7 +371,7 @@ mod tests {
 
     #[test]
     fn write_kv_then_blocks_spans_appended_batches() {
-        let mut cache = Cache::new(&test_config(), &Device::Cpu).unwrap();
+        let mut cache = Cache::new(&test_config(), DType::F32, &Device::Cpu).unwrap();
         cache.allocate_kv(2).unwrap();
         let k1 = candle_core::Tensor::zeros((1, 2, 2, 4), candle_core::DType::F32, &Device::Cpu)
             .unwrap();
@@ -387,14 +390,14 @@ mod tests {
 
     #[test]
     fn allocate_kv_overflow_past_max_seq_len_errors() {
-        let mut cache = Cache::new(&test_config(), &Device::Cpu).unwrap();
+        let mut cache = Cache::new(&test_config(), DType::F32, &Device::Cpu).unwrap();
         // max_seq_len = 16; reserving 17 tokens in one shot must error.
         assert!(cache.allocate_kv(17).is_err());
     }
 
     #[test]
     fn write_kv_across_two_layers_shares_positions() {
-        let mut cache = Cache::new(&test_config(), &Device::Cpu).unwrap();
+        let mut cache = Cache::new(&test_config(), DType::F32, &Device::Cpu).unwrap();
         let k = candle_core::Tensor::zeros((1, 2, 3, 4), candle_core::DType::F32, &Device::Cpu)
             .unwrap();
         // allocate_kv advances once for the batch; both layers reuse the same slots.
@@ -409,7 +412,7 @@ mod tests {
     fn kv_blocks_round_trips_written_values() {
         // Two-token write across a single block must read back identically (zero-copy view).
         let cfg = test_config();
-        let mut cache = Cache::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
         cache.allocate_kv(2).unwrap();
         let data: Vec<f32> = (0..(2 * 2 * 4)).map(|i| i as f32).collect();
         let k = candle_core::Tensor::from_vec(data.clone(), (1, 2, 2, 4), &Device::Cpu).unwrap();
@@ -447,7 +450,7 @@ mod tests {
 
     #[test]
     fn match_prefix_is_empty_before_anything_is_registered() {
-        let mut cache = Cache::new(&prefix_config(), &Device::Cpu).unwrap();
+        let mut cache = Cache::new(&prefix_config(), DType::F32, &Device::Cpu).unwrap();
         let ids: Vec<u32> = (0..40).collect(); // 2 full blocks + partial
         cache.reset_sequence();
         assert_eq!(cache.match_prefix(&ids), 0);
@@ -456,7 +459,7 @@ mod tests {
     #[test]
     fn register_then_match_reuses_full_blocks_and_leaves_a_suffix() {
         let cfg = prefix_config();
-        let mut cache = Cache::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
         let ids: Vec<u32> = (0..40).collect(); // 40 tokens => 2 full blocks (32) + 8 partial
 
         // First request: nothing cached, allocate + fill all 40, then register full blocks.
@@ -476,7 +479,7 @@ mod tests {
     #[test]
     fn match_prefix_leaves_last_block_when_prompt_is_block_aligned() {
         let cfg = prefix_config();
-        let mut cache = Cache::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
         let ids: Vec<u32> = (0..32).collect(); // exactly 2 full blocks, no partial tail
 
         cache.reset_sequence();
@@ -493,7 +496,7 @@ mod tests {
     #[test]
     fn reset_sequence_frees_unregistered_blocks_but_keeps_registered_ones() {
         let cfg = prefix_config();
-        let mut cache = Cache::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
         let ids: Vec<u32> = (0..40).collect();
 
         cache.reset_sequence();
@@ -511,7 +514,7 @@ mod tests {
     #[test]
     fn clear_prefix_cache_disables_reuse() {
         let cfg = prefix_config();
-        let mut cache = Cache::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
         let ids: Vec<u32> = (0..40).collect();
 
         cache.reset_sequence();
@@ -528,7 +531,7 @@ mod tests {
     #[test]
     fn clear_prefix_cache_releases_registry_only_blocks_to_the_pool() {
         let cfg = prefix_config();
-        let mut cache = Cache::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
         let ids: Vec<u32> = (0..40).collect(); // 2 full blocks registered + partial tail
 
         cache.reset_sequence();

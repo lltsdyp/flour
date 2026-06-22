@@ -16,6 +16,11 @@ struct Args {
     #[arg(long)]
     model_dir: PathBuf,
 
+    /// Dtype to load the model in: f32, bf16, or f16. Defaults to the model's `torch_dtype`
+    /// from config.json (falling back to f32).
+    #[arg(long)]
+    dtype: Option<String>,
+
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
@@ -30,8 +35,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    let dtype = args.dtype.as_deref().map(flour::engine::parse_dtype).transpose()?;
     tracing::info!("loading model from {}", args.model_dir.display());
-    let engine = Engine::load(&args.model_dir)?;
+    let engine = Engine::load(&args.model_dir, dtype)?;
     tracing::info!("model loaded: {}", engine.model_id());
 
     let started_at = std::time::SystemTime::now()

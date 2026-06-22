@@ -39,7 +39,7 @@ mod tests {
     #[tokio::test]
     async fn lists_the_single_loaded_model() {
         let dir = fixture_engine_dir();
-        let engine = Engine::load(dir.path()).unwrap();
+        let engine = Engine::load(dir.path(), None).unwrap();
         let expected_id = engine.model_id().to_string();
         let state = AppState {
             engine: Arc::new(Mutex::new(engine)),

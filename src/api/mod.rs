@@ -38,7 +38,7 @@ mod tests {
 
     async fn spawn_test_server() -> std::net::SocketAddr {
         let dir = crate::engine::tests::fixture_dir_for_external_use();
-        let engine = Engine::load(dir.path()).unwrap();
+        let engine = Engine::load(dir.path(), None).unwrap();
         std::mem::forget(dir);
         let state = AppState {
             engine: Arc::new(Mutex::new(engine)),

@@ -146,7 +146,7 @@ mod tests {
 
     fn make_state() -> AppState {
         let dir = crate::engine::tests::fixture_dir_for_external_use();
-        let engine = Engine::load(dir.path()).unwrap();
+        let engine = Engine::load(dir.path(), None).unwrap();
         // Keep the tempdir alive for the engine's lifetime by leaking it — fine in tests.
         std::mem::forget(dir);
         AppState {

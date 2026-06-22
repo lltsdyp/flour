@@ -120,7 +120,7 @@ mod tests {
     fn forward_preserves_shape() {
         let cfg = test_config();
         let layer = DecoderLayer::load(make_vb(&cfg), &cfg).unwrap();
-        let mut cache = Cache::new(&cfg, &Device::Cpu).unwrap();
+        let mut cache = Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
         let x = make_tensor(&[1, 4, cfg.hidden_size], 50);
         cache.allocate_kv(4).unwrap();
         let y = layer.forward(&x, 0, 0, &mut cache).unwrap();

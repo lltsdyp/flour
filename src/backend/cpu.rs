@@ -78,8 +78,10 @@ pub fn paged_attention(
         let k = repeat_kv(k.clone(), n_rep)?;
         let v = repeat_kv(v.clone(), n_rep)?;
 
-        // (b, heads, seq_q, block_n)
-        let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
+        // (b, heads, seq_q, block_n). The q@k^T matmul runs in the model dtype (fast for
+        // bf16/f16), but the online-softmax accumulation below is done in f32 for numerical
+        // stability, so cast the scores up front.
+        let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?.to_dtype(DType::F32)?;
 
         // Per-block causal mask: kv position `kv_start + j` is in the future of query `i`
         // (global position `offset + i`) when `kv_start + j > offset + i`.
@@ -97,12 +99,14 @@ pub fn paged_attention(
         let probs = scores.broadcast_sub(&new_max)?.exp()?; // (b, heads, seq_q, block_n)
 
         running_sum = (running_sum.broadcast_mul(&correction)? + probs.sum_keepdim(D::Minus1)?)?;
-        acc = (acc.broadcast_mul(&correction)? + probs.matmul(&v.contiguous()?)?)?;
+        acc = (acc.broadcast_mul(&correction)? + probs.matmul(&v.contiguous()?.to_dtype(DType::F32)?)?)?;
         running_max = new_max;
         kv_start += block_n;
     }
 
-    acc.broadcast_div(&running_sum)
+    // Accumulation happened in f32; return in the query's (model) dtype so downstream layers
+    // see a consistent dtype.
+    acc.broadcast_div(&running_sum)?.to_dtype(q.dtype())
 }
 
 #[cfg(test)]
@@ -233,6 +237,40 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert_close(&out, &reference);
+    }
+
+    #[test]
+    fn paged_attention_bf16_matches_f32_reference() {
+        let scale = 1.0 / (4f64).sqrt();
+        let q = rand_tensor(&[1, 2, 5, 4], 1);
+        let k = rand_tensor(&[1, 2, 5, 4], 2);
+        let v = rand_tensor(&[1, 2, 5, 4], 3);
+        // f32 dense result is the ground truth.
+        let reference = dense_reference(&q, &k, &v, 1, scale);
+        // Run the kernel in bf16 and confirm the output stays close after the f32 accumulation.
+        let blocks: Vec<(Tensor, Tensor)> = into_blocks(&k, &v, 2)
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.to_dtype(DType::BF16).unwrap(),
+                    v.to_dtype(DType::BF16).unwrap(),
+                )
+            })
+            .collect();
+        let q_bf16 = q.to_dtype(DType::BF16).unwrap();
+        let out = paged_attention(&q_bf16, &blocks, 1, scale).unwrap();
+        assert_eq!(out.dtype(), DType::BF16);
+        let out: Vec<f32> = out
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        // bf16 has ~3 decimal digits of precision, so allow a loose tolerance.
+        for (x, y) in out.iter().zip(reference.iter()) {
+            assert!((x - y).abs() < 5e-2, "mismatch: {x} vs {y}");
+        }
     }
 
     #[test]
