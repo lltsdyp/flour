@@ -1,3 +1,4 @@
+pub mod bundle;
 pub mod distkv_store;
 pub mod key;
 pub mod local;
