@@ -276,6 +276,8 @@ mod tests {
             completion_tokens: 2,
             reused_prefix_tokens: 0,
             finish_reason: FinishReason::Stop,
+            remote_cache_hit: None,
+            remote_key: None,
         };
         let resp = ChatCompletionResponse::new("flour".into(), "hello".into(), &stats);
         let json = serde_json::to_value(&resp).unwrap();
@@ -291,6 +293,8 @@ mod tests {
             completion_tokens: 2,
             reused_prefix_tokens: 0,
             finish_reason: FinishReason::Length,
+            remote_cache_hit: None,
+            remote_key: None,
         };
         let resp = ChatCompletionResponse::new("flour".into(), "hi".into(), &stats);
         let json = serde_json::to_value(&resp).unwrap();

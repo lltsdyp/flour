@@ -26,6 +26,16 @@ struct Args {
 
     #[arg(long, default_value_t = 8080)]
     port: u16,
+
+    /// Enable the optional distributed KV cache client. Requires
+    /// `--remote-kv-master-url`. When the Master is unreachable, generation
+    /// transparently falls back to local prefill.
+    #[arg(long, default_value_t = false)]
+    remote_kv_enabled: bool,
+
+    /// Master URL for the distributed KV cache (e.g. http://127.0.0.1:8081).
+    #[arg(long)]
+    remote_kv_master_url: Option<String>,
 }
 
 #[tokio::main]
@@ -35,10 +45,22 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let dtype = args.dtype.as_deref().map(flour::engine::parse_dtype).transpose()?;
+    let dtype = args
+        .dtype
+        .as_deref()
+        .map(flour::engine::parse_dtype)
+        .transpose()?;
     tracing::info!("loading model from {}", args.model_dir.display());
-    let engine = Engine::load(&args.model_dir, dtype)?;
+    let mut engine = Engine::load(&args.model_dir, dtype)?;
     tracing::info!("model loaded: {}", engine.model_id());
+
+    if args.remote_kv_enabled {
+        let master_url = args.remote_kv_master_url.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--remote-kv-enabled requires --remote-kv-master-url")
+        })?;
+        engine.enable_remote_kv(master_url)?;
+        tracing::info!("remote KV cache enabled against master {master_url}");
+    }
 
     let started_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

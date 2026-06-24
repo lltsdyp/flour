@@ -81,7 +81,8 @@ pub fn paged_attention(
         // (b, heads, seq_q, block_n). The q@k^T matmul runs in the model dtype (fast for
         // bf16/f16), but the online-softmax accumulation below is done in f32 for numerical
         // stability, so cast the scores up front.
-        let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?.to_dtype(DType::F32)?;
+        let scores =
+            (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?.to_dtype(DType::F32)?;
 
         // Per-block causal mask: kv position `kv_start + j` is in the future of query `i`
         // (global position `offset + i`) when `kv_start + j > offset + i`.
@@ -99,7 +100,8 @@ pub fn paged_attention(
         let probs = scores.broadcast_sub(&new_max)?.exp()?; // (b, heads, seq_q, block_n)
 
         running_sum = (running_sum.broadcast_mul(&correction)? + probs.sum_keepdim(D::Minus1)?)?;
-        acc = (acc.broadcast_mul(&correction)? + probs.matmul(&v.contiguous()?.to_dtype(DType::F32)?)?)?;
+        acc = (acc.broadcast_mul(&correction)?
+            + probs.matmul(&v.contiguous()?.to_dtype(DType::F32)?)?)?;
         running_max = new_max;
         kv_start += block_n;
     }

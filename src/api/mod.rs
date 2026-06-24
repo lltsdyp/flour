@@ -23,6 +23,24 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Mounts the distributed KV cache Master/Worker routes onto `router` when the
+/// node's role requires them. Each sub-router carries its own state, so the
+/// engine `AppState` is untouched.
+pub fn mount_distkv(
+    router: Router,
+    master: Option<crate::distkv::http::SharedMaster>,
+    worker: Option<crate::distkv::http::SharedWorker>,
+) -> Router {
+    let mut router = router;
+    if let Some(master) = master {
+        router = router.merge(crate::distkv::http::master_router(master));
+    }
+    if let Some(worker) = worker {
+        router = router.merge(crate::distkv::http::worker_router(worker));
+    }
+    router
+}
+
 pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on http://{addr}");

@@ -3,6 +3,8 @@ use std::path::Path;
 use anyhow::Context;
 use candle_core::{DType, Device, IndexOp, Tensor};
 
+use crate::distkv::client::DistKvClient;
+use crate::distkv::scheduler::{CacheScheduler, BLOCK_SIZE};
 use crate::loader::safetensors::load_var_builder;
 use crate::models::{
     self,
@@ -10,6 +12,40 @@ use crate::models::{
 };
 use crate::sampling::{apply_repeat_penalty, LogitsSampler, SamplingParams};
 use crate::tokenizer::{ChatMessage, ChatTemplate, Tokenizer};
+
+/// Blocking bridge from the synchronous engine to the async `DistKvClient`.
+///
+/// `Engine::generate` is synchronous and runs inside `spawn_blocking` on the
+/// server, so it cannot `.await`. This owns a dedicated current-thread runtime
+/// and drives the async client via `block_on`. Calling `block_on` is safe from
+/// a `spawn_blocking` worker because that thread is not an async context.
+pub struct RemoteKvCache {
+    client: DistKvClient,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl RemoteKvCache {
+    /// Creates a remote cache handle for the given Master URL. This does not
+    /// connect; failures surface lazily on the first `get`/`put`, which keeps
+    /// the remote cache strictly optional (the Master may be down).
+    pub fn connect(master_url: &str) -> anyhow::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok(Self {
+            client: DistKvClient::new(master_url),
+            runtime,
+        })
+    }
+
+    fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        self.runtime.block_on(self.client.get_object(key))
+    }
+
+    fn put(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
+        self.runtime.block_on(self.client.put_object(key, bytes))
+    }
+}
 
 /// Parse a dtype name into a `DType`. Accepts both short forms (`f32`, `bf16`, `f16`) and the
 /// torch names found in `config.json` (`float32`, `bfloat16`, `float16`), case-insensitively.
@@ -24,10 +60,7 @@ pub fn parse_dtype(s: &str) -> anyhow::Result<DType> {
 
 /// Decide which dtype to load the model in. An explicit override always wins; otherwise fall back
 /// to the model's `torch_dtype` from `config.json`, and finally to f32 if that is absent.
-fn resolve_dtype(
-    dtype_override: Option<DType>,
-    raw: &serde_json::Value,
-) -> anyhow::Result<DType> {
+fn resolve_dtype(dtype_override: Option<DType>, raw: &serde_json::Value) -> anyhow::Result<DType> {
     if let Some(dtype) = dtype_override {
         return Ok(dtype);
     }
@@ -60,6 +93,13 @@ pub struct GenerationStats {
     pub completion_tokens: usize,
     pub reused_prefix_tokens: usize,
     pub finish_reason: FinishReason,
+    /// Remote KV cache outcome for this request, when the remote cache is
+    /// enabled: `Some(true)` on a remote hit, `Some(false)` on a miss (or a
+    /// best-effort error), `None` when the remote cache is disabled.
+    pub remote_cache_hit: Option<bool>,
+    /// The prefix object key used for the remote cache, when enabled. Exposed
+    /// for metrics and observability.
+    pub remote_key: Option<String>,
 }
 
 pub struct Engine {
@@ -70,6 +110,10 @@ pub struct Engine {
     device: Device,
     model_id: String,
     cache: std::sync::Mutex<Cache>,
+    /// Optional remote KV cache. Strictly best-effort: when unset or
+    /// unreachable, generation falls back to local prefill with no behavior
+    /// change.
+    remote_kv: Option<RemoteKvCache>,
 }
 
 impl Engine {
@@ -114,11 +158,20 @@ impl Engine {
             device,
             model_id,
             cache,
+            remote_kv: None,
         })
     }
 
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    /// Enables the remote KV cache against the given Master URL. Best-effort:
+    /// the Master need not be reachable now, and remote failures never abort
+    /// generation.
+    pub fn enable_remote_kv(&mut self, master_url: &str) -> anyhow::Result<()> {
+        self.remote_kv = Some(RemoteKvCache::connect(master_url)?);
+        Ok(())
     }
 
     pub fn generate(
@@ -130,6 +183,25 @@ impl Engine {
         let prompt = self.chat_template.render(messages);
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
         let prompt_len = prompt_tokens.len();
+
+        // Remote KV cache lookup (best-effort). Records a hit/miss metric only;
+        // the bytes are opaque for this milestone. A remote failure (e.g. Master
+        // down) is treated as a miss so local prefill proceeds unchanged.
+        let remote_key = self
+            .remote_kv
+            .as_ref()
+            .map(|_| CacheScheduler::prefix_key(&self.model_id, &prompt_tokens, BLOCK_SIZE));
+        let remote_cache_hit = match (&self.remote_kv, &remote_key) {
+            (Some(remote), Some(key)) => Some(match remote.get(key) {
+                Ok(Some(_bytes)) => true,
+                Ok(None) => false,
+                Err(e) => {
+                    tracing::warn!("remote kv get failed, falling back to local prefill: {e}");
+                    false
+                }
+            }),
+            _ => None,
+        };
 
         let mut cache = self
             .cache
@@ -200,11 +272,29 @@ impl Engine {
             "Generate finished, generated tokens count:{}",
             completion_tokens
         );
+
+        // Release the cache lock before any remote network I/O.
+        drop(cache);
+
+        // Remote KV cache store (best-effort, async PUT after prefill). Stores an
+        // opaque object for this milestone; a failure is logged and ignored so
+        // inference is never blocked on the remote cache.
+        if let (Some(remote), Some(key)) = (&self.remote_kv, &remote_key) {
+            if CacheScheduler::should_store(prompt_len, reused_prefix_tokens) {
+                let bytes: Vec<u8> = prompt_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+                if let Err(e) = remote.put(key, bytes) {
+                    tracing::warn!("remote kv put failed (ignored): {e}");
+                }
+            }
+        }
+
         Ok(GenerationStats {
             prompt_tokens: prompt_len,
             completion_tokens,
             reused_prefix_tokens,
             finish_reason,
+            remote_cache_hit,
+            remote_key,
         })
     }
 }
@@ -517,6 +607,130 @@ pub(crate) mod tests {
         // With no EOS or stop sequence hit, generation runs to the token budget.
         assert_eq!(stats.completion_tokens, 3);
         assert_eq!(stats.finish_reason, FinishReason::Length);
+    }
+
+    // --- Remote KV cache integration (Task 6) ---
+
+    use crate::distkv::http::{master_router, worker_router};
+    use crate::distkv::master::MasterState;
+    use crate::distkv::worker::WorkerStore;
+    use std::sync::{Arc, Mutex};
+
+    async fn spawn(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// Brings up a Master + one registered Worker and returns the Master URL.
+    async fn remote_cluster() -> String {
+        let master = Arc::new(Mutex::new(MasterState::new(|| 1_000)));
+        let master_url = spawn(master_router(master)).await;
+        let worker = Arc::new(Mutex::new(WorkerStore::new("w1".into(), 1, 1 << 20)));
+        let worker_url = spawn(worker_router(worker)).await;
+
+        // Register the worker with its data-path URL.
+        reqwest::Client::new()
+            .post(format!("{master_url}/v1/distkv/workers/register"))
+            .json(&crate::distkv::protocol::RegisterRequest {
+                worker_id: "w1".into(),
+                addr: worker_url,
+                capacity_bytes: 1 << 20,
+            })
+            .send()
+            .await
+            .unwrap();
+        master_url
+    }
+
+    fn loaded_engine() -> Engine {
+        let dir = tests::fixture_dir_for_external_use();
+        let engine = Engine::load(dir.path(), None).unwrap();
+        std::mem::forget(dir);
+        engine
+    }
+
+    fn hi() -> Vec<ChatMessage> {
+        vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }]
+    }
+
+    /// Runs `generate` on a blocking thread (mirroring the server), so the
+    /// engine's owned runtime can `block_on` the async remote calls.
+    async fn run_generate(engine: Arc<Mutex<Engine>>) -> GenerationStats {
+        let params = crate::sampling::SamplingParams {
+            max_tokens: 4,
+            seed: 7,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        tokio::task::spawn_blocking(move || engine.lock().unwrap().generate(&hi(), &params, |_| {}))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generation_succeeds_when_master_is_down() {
+        let mut engine = loaded_engine();
+        // Point at a port where nothing is listening.
+        engine.enable_remote_kv("http://127.0.0.1:9").unwrap();
+        let engine = Arc::new(Mutex::new(engine));
+
+        let stats = run_generate(engine.clone()).await;
+        // Generation still works; the failed remote lookup counts as a miss.
+        assert!(stats.completion_tokens > 0);
+        assert_eq!(stats.remote_cache_hit, Some(false));
+
+        std::mem::forget(engine);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generation_puts_remote_object_after_prefill_when_enabled() {
+        let master_url = remote_cluster().await;
+        let mut engine = loaded_engine();
+        engine.enable_remote_kv(&master_url).unwrap();
+        let engine = Arc::new(Mutex::new(engine));
+
+        let stats = run_generate(engine.clone()).await;
+        let key = stats.remote_key.clone().expect("remote enabled => key set");
+        assert_eq!(stats.remote_cache_hit, Some(false), "cold cache is a miss");
+
+        // The object must now be fetchable directly from the worker via a route.
+        let client = DistKvClient::new(master_url);
+        let bytes = client.get_object(&key).await.unwrap();
+        assert!(
+            bytes.is_some(),
+            "engine should have stored the prefix bundle"
+        );
+
+        std::mem::forget(engine);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn second_request_observes_remote_cache_hit_metric() {
+        let master_url = remote_cluster().await;
+        let mut engine = loaded_engine();
+        engine.enable_remote_kv(&master_url).unwrap();
+        let engine = Arc::new(Mutex::new(engine));
+
+        let first = run_generate(engine.clone()).await;
+        assert_eq!(first.remote_cache_hit, Some(false));
+
+        let second = run_generate(engine.clone()).await;
+        assert_eq!(
+            second.remote_cache_hit,
+            Some(true),
+            "second identical prompt should hit the remote cache"
+        );
+        assert_eq!(first.remote_key, second.remote_key);
+
+        std::mem::forget(engine);
     }
 
     #[test]

@@ -1,0 +1,78 @@
+# Simplest distributed KV cache cluster for flour:
+#   1 Master (metadata) + 2 Workers (object bytes) + 1 optional engine node.
+#
+# Bring up just the KV cluster (Master + Workers):
+#   docker compose -f examples/cluster/docker-compose.yml up --build
+#
+# Also start the inference engine wired to the cluster (needs a model on disk):
+#   MODEL_DIR=/abs/path/to/model \
+#     docker compose -f examples/cluster/docker-compose.yml --profile engine up --build
+#
+# All services share one image, so the build runs only once.
+
+# Shared build definition: context is the repo root, two levels up from this file.
+x-flour-build: &flour-build
+  image: flour-cluster:latest
+  build:
+    context: ../..
+    dockerfile: examples/cluster/Dockerfile
+
+services:
+  master:
+    <<: *flour-build
+    command: ["flour-master", "--host", "0.0.0.0", "--port", "8081"]
+    environment:
+      RUST_LOG: info
+    ports:
+      - "8081:8081" # metadata path, handy for curl smoke tests
+
+  worker1:
+    <<: *flour-build
+    command:
+      - flour-worker
+      - --worker-id=worker1
+      - --master-url=http://master:8081
+      - --advertise-url=http://worker1:8090
+      - --port=8090
+      - --capacity-bytes=1073741824 # 1 GiB
+    environment:
+      RUST_LOG: info
+    depends_on:
+      - master
+
+  worker2:
+    <<: *flour-build
+    command:
+      - flour-worker
+      - --worker-id=worker2
+      - --master-url=http://master:8081
+      - --advertise-url=http://worker2:8090
+      - --port=8090
+      - --capacity-bytes=1073741824 # 1 GiB
+    environment:
+      RUST_LOG: info
+    depends_on:
+      - master
+
+  # Optional: an inference node that uses the cluster as a remote KV cache.
+  # Enabled only with `--profile engine`. Mount a model dir via MODEL_DIR.
+  engine:
+    <<: *flour-build
+    profiles: ["engine"]
+    command:
+      - flour
+      - --model-dir=/models
+      - --host=0.0.0.0
+      - --port=8080
+      - --remote-kv-enabled
+      - --remote-kv-master-url=http://master:8081
+    environment:
+      RUST_LOG: info
+    volumes:
+      - ${MODEL_DIR:-./model}:/models:ro
+    ports:
+      - "8080:8080" # OpenAI-compatible API
+    depends_on:
+      - master
+      - worker1
+      - worker2

@@ -146,8 +146,16 @@ impl PagedKvPool {
         let mut k_pools = Vec::with_capacity(num_layers);
         let mut v_pools = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            k_pools.push(Tensor::zeros((kv_heads, num_slots, head_dim), dtype, device)?);
-            v_pools.push(Tensor::zeros((kv_heads, num_slots, head_dim), dtype, device)?);
+            k_pools.push(Tensor::zeros(
+                (kv_heads, num_slots, head_dim),
+                dtype,
+                device,
+            )?);
+            v_pools.push(Tensor::zeros(
+                (kv_heads, num_slots, head_dim),
+                dtype,
+                device,
+            )?);
         }
         Ok(Self {
             k_pools,
@@ -164,15 +172,15 @@ impl PagedKvPool {
         let vt = v.squeeze(0)?;
         let k_pool = &self.k_pools[layer_idx];
         let v_pool = &self.v_pools[layer_idx];
-        let mut i=0;
+        let mut i = 0;
         while i < slots.len() {
-            let mut n=1;
+            let mut n = 1;
             let start_slot = slots[i] as usize;
-            while i + n < slots.len() && i+n == start_slot+n {
+            while i + n < slots.len() && i + n == start_slot + n {
                 n += 1;
             }
-            k_pool.slice_set(&kt.narrow(1,i,n)?.contiguous()?,1,start_slot)?;
-            v_pool.slice_set(&vt.narrow(1, i, n)?.contiguous()?,1,start_slot)?;
+            k_pool.slice_set(&kt.narrow(1, i, n)?.contiguous()?, 1, start_slot)?;
+            v_pool.slice_set(&vt.narrow(1, i, n)?.contiguous()?, 1, start_slot)?;
             i += n;
         }
         Ok(())
