@@ -58,6 +58,32 @@ impl CausalLM {
         self.lm_head.forward(&x)
     }
 
+    /// Run the network over only the unmatched suffix `input_ids[reused_prefix_tokens..]`, given
+    /// that the first `reused_prefix_tokens` tokens already sit in `cache` (from a local match or
+    /// a remote import). Does NOT reset the sequence, do local prefix matching, or register the
+    /// prefix — the caller owns that lifecycle. `forward` allocates KV slots for the suffix,
+    /// writes its K/V into fresh blocks, and runs paged attention over ALL live blocks (reused
+    /// prefix + suffix). RoPE uses `index_pos = reused_prefix_tokens`, so the suffix sits at its
+    /// true absolute positions. Returns the suffix logits (final row = last prompt token).
+    pub fn prefill_suffix(
+        &self,
+        input_ids: &Tensor,
+        reused_prefix_tokens: usize,
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
+        let ids: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
+        let prompt_len = ids.len();
+        if reused_prefix_tokens >= prompt_len {
+            candle_core::bail!(
+                "reused_prefix_tokens {reused_prefix_tokens} must be < prompt_len {prompt_len}; \
+                 cached KV cannot produce the last prompt token's logits"
+            );
+        }
+        let suffix = &ids[reused_prefix_tokens..];
+        let suffix_ids = Tensor::from_vec(suffix.to_vec(), (1, suffix.len()), input_ids.device())?;
+        self.forward(&suffix_ids, reused_prefix_tokens, cache)
+    }
+
     /// Prefill that reuses any cached prefix. Matched leading blocks are read straight from the
     /// KV pool (no recompute); only the unmatched suffix runs through the network. Returns the
     /// suffix logits (final row = last prompt token) and how many prompt tokens were reused.
@@ -66,15 +92,7 @@ impl CausalLM {
 
         cache.reset_sequence();
         let matched = cache.match_prefix(&ids);
-
-        let suffix = &ids[matched..];
-        let suffix_ids = Tensor::from_vec(suffix.to_vec(), (1, suffix.len()), input_ids.device())?;
-
-        // `forward` allocates KV slots for the suffix, writes its K/V into fresh blocks, and
-        // runs paged attention over ALL live blocks (reused prefix + suffix). RoPE uses
-        // `index_pos = matched`, so the suffix sits at its true absolute positions.
-        let logits = self.forward(&suffix_ids, matched, cache)?;
-
+        let logits = self.prefill_suffix(input_ids, matched, cache)?;
         cache.register_prefix(&ids);
         Ok((logits, matched))
     }
@@ -242,6 +260,59 @@ mod tests {
         for (a, b) in ref_last.iter().zip(got_last.iter()) {
             assert!((a - b).abs() < 1e-4, "logit mismatch {a} vs {b}");
         }
+    }
+
+    #[test]
+    fn prefill_suffix_consumes_imported_prefix_and_matches_cold_logits() {
+        let cfg = prefix_test_config();
+        let model = CausalLM::load(make_vb(&cfg), cfg.clone()).unwrap();
+
+        let ids_vec: Vec<u32> = (0..40u32).map(|i| i % cfg.vocab_size as u32).collect();
+        let ids = Tensor::from_vec(ids_vec.clone(), (1, 40), &Device::Cpu).unwrap();
+
+        // Cold reference: full prefill over all 40 tokens.
+        let mut ref_cache = super::super::Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
+        let (ref_logits, reused) = model.prefill_cached(&ids, &mut ref_cache).unwrap();
+        assert_eq!(reused, 0);
+        let ref_last: Vec<f32> = ref_logits
+            .i((0, ref_logits.dim(1).unwrap() - 1))
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        // Cache A: full prefill, then export the first 32 tokens (2 blocks) as a bundle.
+        let mut cache_a = super::super::Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
+        model.prefill_cached(&ids, &mut cache_a).unwrap();
+        let bundle = cache_a.export_prefix_bundle("m", &ids_vec, 32).unwrap();
+
+        // Cache B: import the prefix, then run suffix-only prefill over the remaining 8 tokens.
+        let mut cache_b = super::super::Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
+        let imported = cache_b.import_prefix_bundle(&bundle, &ids_vec).unwrap();
+        assert_eq!(imported, 32);
+
+        let logits = model.prefill_suffix(&ids, imported, &mut cache_b).unwrap();
+        assert_eq!(logits.dim(1).unwrap(), 40 - 32);
+        let got_last: Vec<f32> = logits
+            .i((0, logits.dim(1).unwrap() - 1))
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for (a, b) in ref_last.iter().zip(got_last.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "suffix prefill over imported prefix changed logits: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefill_suffix_rejects_reuse_covering_whole_prompt() {
+        let cfg = prefix_test_config();
+        let model = CausalLM::load(make_vb(&cfg), cfg.clone()).unwrap();
+        let ids = Tensor::from_vec((0..16u32).collect::<Vec<_>>(), (1, 16), &Device::Cpu).unwrap();
+        let mut cache = super::super::Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
+        // reused == prompt_len leaves no suffix to produce last-token logits -> error.
+        assert!(model.prefill_suffix(&ids, 16, &mut cache).is_err());
     }
 
     #[test]
