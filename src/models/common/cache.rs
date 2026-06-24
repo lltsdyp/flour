@@ -227,6 +227,127 @@ impl KvCache {
         })
     }
 
+    /// Import a remote [`KvBundle`] into a fresh sequence: validate it against the local model and
+    /// cache config, allocate one physical block per bundle block, write every layer's K/V, push
+    /// the blocks into the table, and register them in the prefix registry so the suffix forward
+    /// and later requests can reuse them. Returns the imported token count.
+    ///
+    /// Rejects (without leaving partial state) a bundle whose config, dtype, block alignment, or
+    /// token prefix does not match `prompt_tokens`. On a mid-write failure, releases everything it
+    /// allocated and resets the sequence, so a caller can safely fall back to cold prefill.
+    pub fn import_prefix_bundle(
+        &mut self,
+        bundle: &KvBundle,
+        prompt_tokens: &[u32],
+    ) -> Result<usize> {
+        let meta = &bundle.meta;
+        let bs = self.table.block_size();
+
+        if meta.block_size != bs {
+            candle_core::bail!(
+                "bundle block_size {} != cache block_size {bs}",
+                meta.block_size
+            );
+        }
+        if meta.num_layers != self.pool.num_layers() {
+            candle_core::bail!(
+                "bundle num_layers {} != model {}",
+                meta.num_layers,
+                self.pool.num_layers()
+            );
+        }
+        if meta.num_kv_heads != self.pool.kv_heads() {
+            candle_core::bail!(
+                "bundle num_kv_heads {} != model {}",
+                meta.num_kv_heads,
+                self.pool.kv_heads()
+            );
+        }
+        if meta.head_dim != self.pool.head_dim() {
+            candle_core::bail!(
+                "bundle head_dim {} != model {}",
+                meta.head_dim,
+                self.pool.head_dim()
+            );
+        }
+        if BundleDType::from_candle(self.pool.dtype()) != Some(meta.dtype) {
+            candle_core::bail!("bundle dtype {:?} != model dtype", meta.dtype);
+        }
+        if meta.token_count == 0 || meta.token_count % bs != 0 {
+            candle_core::bail!("bundle token_count {} not block aligned", meta.token_count);
+        }
+        if meta.token_ids.len() != meta.token_count {
+            candle_core::bail!("bundle token_ids len != token_count");
+        }
+        if prompt_tokens.len() < meta.token_count
+            || prompt_tokens[..meta.token_count] != meta.token_ids[..]
+        {
+            candle_core::bail!("prompt does not start with bundle token ids");
+        }
+        let num_blocks = meta.token_count / bs;
+        if bundle.blocks.len() != num_blocks {
+            candle_core::bail!(
+                "bundle has {} blocks, expected {num_blocks}",
+                bundle.blocks.len()
+            );
+        }
+
+        // Start a clean sequence, then ensure there is room for every imported block.
+        self.reset_sequence();
+        if self.allocator.num_free() < num_blocks {
+            candle_core::bail!(
+                "not enough free kv blocks to import ({} < {num_blocks})",
+                self.allocator.num_free()
+            );
+        }
+
+        let mut allocated: Vec<usize> = Vec::with_capacity(num_blocks);
+        let write_result = (|| -> Result<()> {
+            for block in &bundle.blocks {
+                if block.layers.len() != meta.num_layers {
+                    candle_core::bail!("bundle block has wrong layer count");
+                }
+                let block_id = self
+                    .allocator
+                    .allocate()
+                    .ok_or_else(|| candle_core::Error::Msg("out of kv blocks".into()))?;
+                allocated.push(block_id);
+                for (layer, lb) in block.layers.iter().enumerate() {
+                    self.pool.write_block(layer, block_id, &lb.k, &lb.v)?;
+                }
+                self.table.push_block(block_id);
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            // Roll back: drop every block we allocated, clear the half-built table.
+            for id in &allocated {
+                self.allocator.decref(*id);
+            }
+            self.table.clear();
+            return Err(e);
+        }
+
+        self.table.advance(meta.token_count);
+
+        // Register imported blocks with the same chained hash + extra refcount as local prefill,
+        // so reset + match_prefix reuses them exactly like a locally-computed prefix.
+        let mut parent = PREFIX_HASH_SEED;
+        for b in 0..num_blocks {
+            let chunk = &meta.token_ids[b * bs..(b + 1) * bs];
+            let h = block_hash(parent, chunk);
+            if !self.registry.contains(h) {
+                let block_id = self.table.block_at(b);
+                self.allocator.incref(block_id);
+                self.registry.insert(h, chunk.to_vec(), block_id);
+            }
+            parent = h;
+        }
+
+        Ok(meta.token_count)
+    }
+
     /// Drop all cached prefixes, releasing the registry's reference on each cached block. The
     /// live sequence's own references are untouched, so an in-flight request is unaffected;
     /// blocks referenced only by the registry return to the free list.
@@ -361,6 +482,17 @@ impl Cache {
         token_count: usize,
     ) -> Result<KvBundle> {
         self.kvs.export_prefix_bundle(model_id, token_ids, token_count)
+    }
+
+    /// Import a remote [`KvBundle`] into a fresh sequence and register its blocks for reuse.
+    /// Returns the imported token count, or an error (leaving no partial state) when the bundle
+    /// is incompatible with this model/cache or with `prompt_tokens`.
+    pub fn import_prefix_bundle(
+        &mut self,
+        bundle: &KvBundle,
+        prompt_tokens: &[u32],
+    ) -> Result<usize> {
+        self.kvs.import_prefix_bundle(bundle, prompt_tokens)
     }
 
     /// Drop all cached prefixes (escape hatch; does not disturb the live sequence).
@@ -649,6 +781,85 @@ mod tests {
                 assert_eq!(bv, want_v, "v mismatch layer {layer} block {b}");
             }
         }
+    }
+
+    /// Build cache A, fill 32 tokens with deterministic K/V, return (cache, bundle, ids 0..32).
+    fn cache_with_bundle() -> (Cache, crate::kv_cache::bundle::KvBundle, Vec<u32>) {
+        let cfg = prefix_config();
+        let mut cache_a = Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
+        let kv_heads = cfg.num_key_value_heads;
+        let head_dim = cfg.head_dim;
+        cache_a.reset_sequence();
+        cache_a.allocate_kv(32).unwrap();
+        for layer in 0..cfg.num_hidden_layers {
+            let n = kv_heads * 32 * head_dim;
+            let kdata: Vec<f32> = (0..n).map(|i| (layer * 1000 + i) as f32 + 0.125).collect();
+            let vdata: Vec<f32> = kdata.iter().map(|x| x + 0.5).collect();
+            let k =
+                candle_core::Tensor::from_vec(kdata, (1, kv_heads, 32, head_dim), &Device::Cpu)
+                    .unwrap();
+            let v =
+                candle_core::Tensor::from_vec(vdata, (1, kv_heads, 32, head_dim), &Device::Cpu)
+                    .unwrap();
+            cache_a.write_kv(layer, &k, &v).unwrap();
+        }
+        let ids: Vec<u32> = (0..32u32).collect();
+        let bundle = cache_a.export_prefix_bundle("m", &ids, 32).unwrap();
+        (cache_a, bundle, ids)
+    }
+
+    #[test]
+    fn import_prefix_bundle_round_trips_values_and_enables_reuse() {
+        let cfg = prefix_config();
+        let (cache_a, bundle, _ids) = cache_with_bundle();
+
+        let mut cache_b = Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
+        let prompt: Vec<u32> = (0..40u32).collect(); // first 32 tokens == bundle ids
+        let imported = cache_b.import_prefix_bundle(&bundle, &prompt).unwrap();
+        assert_eq!(imported, 32);
+
+        // Imported K/V matches cache A's live blocks, layer by layer, block by block.
+        for layer in 0..cfg.num_hidden_layers {
+            let a = cache_a.kv_blocks(layer).unwrap();
+            let b = cache_b.kv_blocks(layer).unwrap();
+            assert_eq!(a.len(), b.len());
+            for i in 0..a.len() {
+                let av: Vec<f32> = a[i].0.flatten_all().unwrap().to_vec1().unwrap();
+                let bv: Vec<f32> = b[i].0.flatten_all().unwrap().to_vec1().unwrap();
+                assert_eq!(av, bv, "k mismatch layer {layer} block {i}");
+                let av2: Vec<f32> = a[i].1.flatten_all().unwrap().to_vec1().unwrap();
+                let bv2: Vec<f32> = b[i].1.flatten_all().unwrap().to_vec1().unwrap();
+                assert_eq!(av2, bv2, "v mismatch layer {layer} block {i}");
+            }
+        }
+
+        // After reset, the registry lets the same prompt reuse the imported blocks.
+        cache_b.reset_sequence();
+        assert_eq!(cache_b.match_prefix(&prompt), 32);
+    }
+
+    #[test]
+    fn import_prefix_bundle_rejects_mismatched_prompt_prefix() {
+        let cfg = prefix_config();
+        let (_a, bundle, _ids) = cache_with_bundle();
+        let mut cache_b = Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
+        let wrong: Vec<u32> = (100..140u32).collect(); // does not start with bundle ids
+        assert!(cache_b.import_prefix_bundle(&bundle, &wrong).is_err());
+        // No partial state survives a rejected import.
+        cache_b.reset_sequence();
+        assert_eq!(cache_b.match_prefix(&wrong), 0);
+    }
+
+    #[test]
+    fn import_prefix_bundle_rejects_dimension_mismatch() {
+        let (_a, bundle, _ids) = cache_with_bundle(); // head_dim 4
+        let cfg2 = Config {
+            head_dim: 8,
+            ..prefix_config()
+        };
+        let mut cache_b = Cache::new(&cfg2, DType::F32, &Device::Cpu).unwrap();
+        let prompt: Vec<u32> = (0..40u32).collect();
+        assert!(cache_b.import_prefix_bundle(&bundle, &prompt).is_err());
     }
 
     #[test]
