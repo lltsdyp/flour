@@ -36,6 +36,7 @@ pub struct KvSession<'a> {
     reusable_tokens: usize,
     remote_key: Option<String>,
     remote_store: Option<Arc<dyn KvObjectStore>>,
+    publish_policy: PublishPolicy,
     reused_prefix_tokens: usize,
     remote_cache_hit: Option<bool>,
     remote_imported_tokens: usize,
@@ -48,11 +49,13 @@ pub struct PrefillOutput {
     pub reused_prefix_tokens: usize,
 }
 
+/// Best-effort publish payload: the prefix object key and the already-encoded bundle bytes. The
+/// bundle is exported and encoded inside `KvSession::finish` (while the cache is still borrowed);
+/// `bundle_bytes` is `None` when policy says there is nothing worth publishing.
 #[derive(Debug)]
 pub struct KvPublish {
     pub key: Option<String>,
-    pub prompt_tokens: Vec<u32>,
-    pub reused_prefix_tokens: usize,
+    pub bundle_bytes: Option<Vec<u8>>,
 }
 
 impl KvCacheManager {
@@ -113,6 +116,7 @@ impl KvCacheManager {
             reusable_tokens: lookup.reusable_tokens,
             remote_key: lookup.remote_key,
             remote_store: self.remote.clone(),
+            publish_policy: self.publish_policy.clone(),
             reused_prefix_tokens: 0,
             remote_cache_hit: None,
             remote_imported_tokens: 0,
@@ -120,21 +124,15 @@ impl KvCacheManager {
         }
     }
 
+    /// Perform only the network PUT of an already-encoded bundle. The publish decision and the
+    /// (cache-bound) export both happened earlier in `KvSession::finish`; this runs after the
+    /// engine has released its cache lock. Best-effort: a failure is logged and ignored.
     pub fn publish_best_effort(&self, publish: KvPublish) {
-        let (Some(remote), Some(key)) = (&self.remote, publish.key) else {
+        let (Some(remote), Some(key), Some(bytes)) =
+            (&self.remote, publish.key, publish.bundle_bytes)
+        else {
             return;
         };
-        if !self
-            .publish_policy
-            .should_store(publish.prompt_tokens.len(), publish.reused_prefix_tokens)
-        {
-            return;
-        }
-        let bytes: Vec<u8> = publish
-            .prompt_tokens
-            .iter()
-            .flat_map(|t| t.to_le_bytes())
-            .collect();
         if let Err(e) = remote.put_object(&key, bytes) {
             tracing::warn!("remote kv put failed (ignored): {e}");
         }
@@ -240,12 +238,49 @@ impl<'a> KvSession<'a> {
         self.remote_error.clone()
     }
 
+    /// Export and encode the reusable prefix bundle for publishing, *while the cache is still
+    /// borrowed*. Returns the key plus encoded bytes; the engine performs the network PUT after
+    /// dropping its cache lock. `bundle_bytes` is `None` when the remote cache is disabled, no key
+    /// exists, the publish policy declines, or export/encode fails — publishing is best-effort and
+    /// never affects the just-completed generation.
     pub fn finish(self) -> KvPublish {
-        KvPublish {
-            key: self.remote_key,
-            prompt_tokens: self.prompt_tokens,
-            reused_prefix_tokens: self.reused_prefix_tokens,
+        let key = self.remote_key.clone();
+        if self.remote_store.is_none() || key.is_none() {
+            return KvPublish {
+                key,
+                bundle_bytes: None,
+            };
         }
+        if !self.publish_policy.should_store(
+            self.prompt_tokens.len(),
+            self.reusable_tokens,
+            self.reused_prefix_tokens,
+        ) {
+            return KvPublish {
+                key,
+                bundle_bytes: None,
+            };
+        }
+
+        let bundle_bytes = match self.cache.export_prefix_bundle(
+            &self.model_id,
+            &self.prompt_tokens,
+            self.reusable_tokens,
+        ) {
+            Ok(bundle) => match KvBundleCodec::encode(&bundle) {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    tracing::warn!("kv bundle encode failed (skipping publish): {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!("kv bundle export failed (skipping publish): {e}");
+                None
+            }
+        };
+
+        KvPublish { key, bundle_bytes }
     }
 }
 
@@ -387,14 +422,79 @@ mod tests {
     }
 
     #[test]
-    fn publish_skips_short_prompts() {
+    fn publish_best_effort_skips_when_no_bundle_bytes() {
         let store = Arc::new(RecordingStore::default());
         let manager = KvCacheManager::with_remote("m", store.clone());
         manager.publish_best_effort(KvPublish {
             key: Some("k".into()),
-            prompt_tokens: vec![1, 2, 3],
-            reused_prefix_tokens: 0,
+            bundle_bytes: None,
         });
         assert!(store.puts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn publish_best_effort_puts_present_bytes() {
+        let store = Arc::new(RecordingStore::default());
+        let manager = KvCacheManager::with_remote("m", store.clone());
+        manager.publish_best_effort(KvPublish {
+            key: Some("k".into()),
+            bundle_bytes: Some(vec![1, 2, 3]),
+        });
+        let puts = store.puts.lock().unwrap();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0], ("k".into(), vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn finish_publishes_real_decodable_bundle_after_cold_prefill() {
+        let cfg = prefix_test_config();
+        let (model, ids, _bytes) = model_prompt_and_bundle_bytes();
+        let store = Arc::new(MemoryKvObjectStore::default());
+        let manager = KvCacheManager::with_remote("m", store.clone());
+        let lookup = manager.prepare(&ids);
+        let key = lookup.remote_key.clone().unwrap();
+
+        let mut cache = Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
+        let mut session = manager.bind_session(lookup, &mut cache, ids.clone());
+        let out = session.prefill(&model, &Device::Cpu).unwrap();
+        assert_eq!(out.reused_prefix_tokens, 0, "store empty => cold prefill");
+
+        let publish = session.finish();
+        let bytes = publish
+            .bundle_bytes
+            .clone()
+            .expect("cold prefill of a 2-block prompt publishes a bundle");
+        // Real bundle, not the old raw-token-id encoding.
+        assert_ne!(bytes.len(), ids.len() * 4);
+        let bundle = KvBundleCodec::decode(&bytes).unwrap();
+        assert_eq!(bundle.meta.model_id, "m");
+        assert_eq!(bundle.meta.token_count, 32);
+
+        manager.publish_best_effort(publish);
+        assert!(store.get_object(&key).unwrap().is_some());
+    }
+
+    #[test]
+    fn finish_skips_publish_when_no_new_reusable_prefix() {
+        // Seed the store with the full reusable prefix, so import covers it and the request
+        // produces nothing new to publish.
+        let cfg = prefix_test_config();
+        let (model, ids, bytes) = model_prompt_and_bundle_bytes();
+        let store = Arc::new(MemoryKvObjectStore::default());
+        let manager = KvCacheManager::with_remote("m", store.clone());
+        let lookup = manager.prepare(&ids);
+        let key = lookup.remote_key.clone().unwrap();
+        store.put_object(&key, bytes).unwrap();
+
+        let mut cache = Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
+        let mut session = manager.bind_session(lookup, &mut cache, ids.clone());
+        let out = session.prefill(&model, &Device::Cpu).unwrap();
+        assert_eq!(out.reused_prefix_tokens, 32);
+
+        let publish = session.finish();
+        assert!(
+            publish.bundle_bytes.is_none(),
+            "fully-reused prefix => skip publish"
+        );
     }
 }
