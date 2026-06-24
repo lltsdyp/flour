@@ -186,6 +186,52 @@ impl PagedKvPool {
         Ok(())
     }
 
+    /// Overwrite one full physical block (`block_id`) with imported K/V. Accepts the
+    /// attention-ready `(1, kv_heads, block_size, head_dim)` layout (squeezed to
+    /// `(kv_heads, block_size, head_dim)`) or that 3-D shape directly. The block occupies the
+    /// contiguous slot run `block_id * block_size .. + block_size`, so the write is a single
+    /// `slice_set` per layer. Used by the remote-KV import path.
+    pub fn write_block(
+        &mut self,
+        layer_idx: usize,
+        block_id: usize,
+        k: &Tensor,
+        v: &Tensor,
+    ) -> Result<()> {
+        let kt = Self::normalize_block(k)?;
+        let vt = Self::normalize_block(v)?;
+        let (kh, block_size, hd) = kt.dims3()?;
+        let (vkh, vbs, vhd) = vt.dims3()?;
+        if (kh, block_size, hd) != (vkh, vbs, vhd) {
+            candle_core::bail!(
+                "write_block k/v shape mismatch: k={:?} v={:?}",
+                kt.dims(),
+                vt.dims()
+            );
+        }
+        if kh != self.kv_heads || hd != self.head_dim {
+            candle_core::bail!(
+                "write_block expects (.., kv_heads={}, block_size, head_dim={}), got kv_heads={kh} head_dim={hd}",
+                self.kv_heads,
+                self.head_dim
+            );
+        }
+        let start_slot = block_id * block_size;
+        self.k_pools[layer_idx].slice_set(&kt.contiguous()?, 1, start_slot)?;
+        self.v_pools[layer_idx].slice_set(&vt.contiguous()?, 1, start_slot)?;
+        Ok(())
+    }
+
+    /// Normalize a block tensor to `(kv_heads, block_size, head_dim)`: squeeze a leading batch
+    /// axis of 1 if present, accept the 3-D shape as-is, reject anything else.
+    fn normalize_block(t: &Tensor) -> Result<Tensor> {
+        match t.rank() {
+            4 => t.squeeze(0),
+            3 => Ok(t.clone()),
+            r => candle_core::bail!("write_block expects rank 3 or 4 tensor, got rank {r}"),
+        }
+    }
+
     /// Read an arbitrary slot list back as `(1, kv_heads, n, head_dim)`. The gather (one
     /// `index_select`) is unavoidable for non-contiguous slots; prefer [`Self::block_view`]
     /// when the slots form a contiguous run.
@@ -240,6 +286,40 @@ mod tests {
         let gv: Vec<f32> = gv.flatten_all().unwrap().to_vec1().unwrap();
         assert_eq!(gk, vec![3.0, 4.0, 1.0, 2.0]);
         assert_eq!(gv, vec![7.0, 8.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn paged_pool_write_block_round_trips_full_block() {
+        // 1 layer, 4 slots (= 2 physical blocks of size 2), 1 kv head, head_dim 2.
+        let dev = Device::Cpu;
+        let mut pool = PagedKvPool::new(1, 4, 1, 2, DType::F32, &dev).unwrap();
+
+        // Write a full block of 2 slots into physical block 1 (slots 2..4).
+        let k = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 1, 2, 2), &dev).unwrap();
+        let v = Tensor::from_vec(vec![5f32, 6.0, 7.0, 8.0], (1, 1, 2, 2), &dev).unwrap();
+        pool.write_block(0, 1, &k, &v).unwrap();
+
+        // block_view reads back the contiguous run at start_slot = block_id * block_size = 2.
+        let (rk, rv) = pool.block_view(0, 2, 2).unwrap();
+        assert_eq!(rk.dims(), &[1, 1, 2, 2]);
+        let rk: Vec<f32> = rk.flatten_all().unwrap().to_vec1().unwrap();
+        let rv: Vec<f32> = rv.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(rk, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(rv, vec![5.0, 6.0, 7.0, 8.0]);
+
+        // Physical block 0 (slots 0..2) is untouched and still zero.
+        let (zk, _) = pool.block_view(0, 0, 2).unwrap();
+        let zk: Vec<f32> = zk.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(zk, vec![0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn write_block_rejects_mismatched_kv_heads() {
+        let dev = Device::Cpu;
+        let mut pool = PagedKvPool::new(1, 4, 1, 2, DType::F32, &dev).unwrap();
+        // kv_heads = 2 but the pool was built with 1.
+        let k = Tensor::zeros((1, 2, 2, 2), DType::F32, &dev).unwrap();
+        assert!(pool.write_block(0, 0, &k, &k).is_err());
     }
 
     #[test]
