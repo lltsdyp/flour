@@ -169,11 +169,9 @@ impl Engine {
         let prompt_tokens = self.tokenizer.encode(&prompt)?;
         let prompt_len = prompt_tokens.len();
 
-        // Remote KV cache lookup (best-effort). Records a hit/miss metric only;
-        // the bytes are opaque for this milestone. A remote failure (e.g. Master
-        // down) is treated as a miss so local prefill proceeds unchanged.
+        // Remote KV cache plan (best-effort): just the reusable prefix key and length. The actual
+        // remote fetch + import happens inside `KvSession::prefill`, which holds the cache lock.
         let lookup = self.kv_cache.prepare(&prompt_tokens);
-        let remote_cache_hit = lookup.remote_cache_hit;
         let remote_key = lookup.remote_key.clone();
 
         let mut cache = self
@@ -189,6 +187,8 @@ impl Engine {
         let prefill = kv_session.prefill(&self.model, &self.device)?;
         let mut logits = prefill.logits;
         let reused_prefix_tokens = prefill.reused_prefix_tokens;
+        // The hit/miss metric is known only after prefill performed (or skipped) the remote fetch.
+        let remote_cache_hit = kv_session.remote_cache_hit();
         let mut completion_tokens = 0usize;
 
         tracing::info!(

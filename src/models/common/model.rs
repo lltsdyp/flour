@@ -102,15 +102,16 @@ impl CausalLM {
     }
 }
 
+/// Tiny, deterministic model/config builders shared by unit tests across the crate (e.g. the
+/// kv_cache manager's remote-import test needs a real `CausalLM`). Test-only.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
-    use crate::models::common::Config;
-    use candle_core::{DType, Device, IndexOp, Tensor};
+    use candle_core::{DType, Device, Tensor};
     use candle_nn::VarBuilder;
     use std::collections::HashMap;
 
-    fn test_config() -> Config {
+    pub(crate) fn test_config() -> Config {
         Config {
             hidden_size: 8,
             intermediate_size: 16,
@@ -129,6 +130,14 @@ mod tests {
         }
     }
 
+    /// Like [`test_config`] but with a 64-token window (4 blocks), for prefix-reuse tests.
+    pub(crate) fn prefix_test_config() -> Config {
+        Config {
+            max_seq_len: 64,
+            ..test_config()
+        }
+    }
+
     fn make_tensor(shape: &[usize], seed: u64) -> Tensor {
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
@@ -138,7 +147,7 @@ mod tests {
         Tensor::from_vec(data, shape, &Device::Cpu).unwrap()
     }
 
-    fn make_vb(cfg: &Config) -> VarBuilder<'static> {
+    pub(crate) fn make_vb(cfg: &Config) -> VarBuilder<'static> {
         let h = cfg.hidden_size;
         let i = cfg.intermediate_size;
         let size_q = cfg.head_dim * cfg.num_attention_heads;
@@ -193,6 +202,13 @@ mod tests {
         }
         VarBuilder::from_tensors(map, DType::F32, &Device::Cpu)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{make_vb, prefix_test_config, test_config};
+    use super::*;
+    use candle_core::{DType, Device, IndexOp, Tensor};
 
     #[test]
     fn forward_prefill_returns_logits_for_every_position() {
@@ -223,13 +239,6 @@ mod tests {
         // No "lm_head.weight" tensor was provided, so loading only succeeds if
         // tie_word_embeddings correctly reused embed_tokens instead of fetching lm_head.
         assert_eq!(model.config().vocab_size, cfg.vocab_size);
-    }
-
-    fn prefix_test_config() -> Config {
-        Config {
-            max_seq_len: 64,
-            ..test_config()
-        }
     }
 
     #[test]
