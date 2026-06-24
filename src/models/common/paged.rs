@@ -166,6 +166,23 @@ impl PagedKvPool {
         })
     }
 
+    pub fn num_layers(&self) -> usize {
+        self.k_pools.len()
+    }
+
+    pub fn kv_heads(&self) -> usize {
+        self.kv_heads
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    /// Element dtype of the pooled K/V tensors (all layers share one dtype).
+    pub fn dtype(&self) -> DType {
+        self.k_pools[0].dtype()
+    }
+
     pub fn write(&mut self, layer_idx: usize, slots: &[u32], k: &Tensor, v: &Tensor) -> Result<()> {
         // (1, kv_heads, seq, head_dim) -> (kv_heads, seq, head_dim); slot axis already aligned.
         let kt = k.squeeze(0)?;

@@ -5,6 +5,7 @@ use candle_core::{DType, Device, Result, Tensor};
 use super::paged::{BlockAllocator, BlockTable, PagedKvPool};
 use super::prefix::{block_hash, PrefixRegistry, PREFIX_HASH_SEED};
 use super::Config;
+use crate::kv_cache::bundle::{BundleDType, KvBundle, KvBundleBlock, KvBundleMeta, KvLayerBlock};
 
 const BLOCK_SIZE: usize = 16;
 
@@ -157,6 +158,75 @@ impl KvCache {
         }
     }
 
+    /// Export the first `token_count` live tokens as a portable [`KvBundle`]. `token_count` must
+    /// be block-aligned and within the live sequence length. Reads the real K/V for every layer
+    /// of every covered logical block straight from the pool (zero-copy views, then a contiguous
+    /// copy into the bundle). Returns an error — not a panic — for misaligned counts or
+    /// unrepresentable dtypes so the caller can degrade to a remote miss.
+    pub fn export_prefix_bundle(
+        &self,
+        model_id: &str,
+        token_ids: &[u32],
+        token_count: usize,
+    ) -> Result<KvBundle> {
+        let bs = self.table.block_size();
+        if token_count == 0 || token_count % bs != 0 {
+            candle_core::bail!("export token_count {token_count} not aligned to block size {bs}");
+        }
+        if token_count > self.table.len() {
+            candle_core::bail!(
+                "export token_count {token_count} exceeds live len {}",
+                self.table.len()
+            );
+        }
+        if token_ids.len() < token_count {
+            candle_core::bail!(
+                "token_ids len {} shorter than token_count {token_count}",
+                token_ids.len()
+            );
+        }
+        let dtype = BundleDType::from_candle(self.pool.dtype()).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "dtype {:?} is not representable in a kv bundle",
+                self.pool.dtype()
+            ))
+        })?;
+
+        let num_layers = self.pool.num_layers();
+        let num_blocks = token_count / bs;
+        let mut blocks = Vec::with_capacity(num_blocks);
+        for b in 0..num_blocks {
+            // The first token of logical block `b` maps to the start of its physical block.
+            let start_slot = self.table.slot(b * bs);
+            let mut layers = Vec::with_capacity(num_layers);
+            for layer in 0..num_layers {
+                let (k, v) = self.pool.block_view(layer, start_slot, bs)?;
+                layers.push(KvLayerBlock {
+                    k: k.squeeze(0)?.contiguous()?,
+                    v: v.squeeze(0)?.contiguous()?,
+                });
+            }
+            blocks.push(KvBundleBlock {
+                logical_block_idx: b,
+                layers,
+            });
+        }
+
+        Ok(KvBundle {
+            meta: KvBundleMeta {
+                model_id: model_id.to_string(),
+                token_count,
+                token_ids: token_ids[..token_count].to_vec(),
+                block_size: bs,
+                num_layers,
+                num_kv_heads: self.pool.kv_heads(),
+                head_dim: self.pool.head_dim(),
+                dtype,
+            },
+            blocks,
+        })
+    }
+
     /// Drop all cached prefixes, releasing the registry's reference on each cached block. The
     /// live sequence's own references are untouched, so an in-flight request is unaffected;
     /// blocks referenced only by the registry return to the free list.
@@ -281,6 +351,16 @@ impl Cache {
     /// Register the completed prefill's full blocks for future reuse.
     pub fn register_prefix(&mut self, token_ids: &[u32]) {
         self.kvs.register_prefix(token_ids);
+    }
+
+    /// Export the first `token_count` live tokens as a portable [`KvBundle`] for cross-node reuse.
+    pub fn export_prefix_bundle(
+        &self,
+        model_id: &str,
+        token_ids: &[u32],
+        token_count: usize,
+    ) -> Result<KvBundle> {
+        self.kvs.export_prefix_bundle(model_id, token_ids, token_count)
     }
 
     /// Drop all cached prefixes (escape hatch; does not disturb the live sequence).
@@ -509,6 +589,79 @@ mod tests {
         cache.reset_sequence();
         // The partial 3rd block is freed; the 2 registered blocks stay live.
         assert_eq!(cache.free_blocks_for_test(), free_after_first + 1);
+    }
+
+    #[test]
+    fn export_prefix_bundle_captures_real_block_kv() {
+        let cfg = prefix_config(); // kv_heads 2, head_dim 4, 2 layers, block_size 16
+        let mut cache = Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
+        let ids: Vec<u32> = (0..32u32).collect();
+        let kv_heads = cfg.num_key_value_heads;
+        let head_dim = cfg.head_dim;
+
+        cache.reset_sequence();
+        cache.allocate_kv(32).unwrap();
+        // Distinct, deterministic K/V per layer so values are checkable against the pool.
+        for layer in 0..cfg.num_hidden_layers {
+            let n = kv_heads * 32 * head_dim;
+            let kdata: Vec<f32> = (0..n).map(|i| (layer * 1000 + i) as f32).collect();
+            let vdata: Vec<f32> = kdata.iter().map(|x| x + 0.25).collect();
+            let k =
+                candle_core::Tensor::from_vec(kdata, (1, kv_heads, 32, head_dim), &Device::Cpu)
+                    .unwrap();
+            let v =
+                candle_core::Tensor::from_vec(vdata, (1, kv_heads, 32, head_dim), &Device::Cpu)
+                    .unwrap();
+            cache.write_kv(layer, &k, &v).unwrap();
+        }
+
+        let bundle = cache.export_prefix_bundle("m", &ids, 32).unwrap();
+        assert_eq!(bundle.meta.model_id, "m");
+        assert_eq!(bundle.meta.token_count, 32);
+        assert_eq!(bundle.meta.block_size, 16);
+        assert_eq!(bundle.blocks.len(), 2);
+        assert_eq!(bundle.meta.num_layers, cfg.num_hidden_layers);
+        assert_eq!(bundle.meta.num_kv_heads, kv_heads);
+        assert_eq!(bundle.meta.head_dim, head_dim);
+        assert_eq!(bundle.meta.dtype, BundleDType::F32);
+        assert_eq!(bundle.meta.token_ids, ids);
+
+        // Exported K/V values must equal what the pool block views return.
+        for layer in 0..cfg.num_hidden_layers {
+            let pool_blocks = cache.kv_blocks(layer).unwrap();
+            assert_eq!(pool_blocks.len(), 2);
+            for (b, (pk, pv)) in pool_blocks.iter().enumerate() {
+                let bk: Vec<f32> = bundle.blocks[b].layers[layer]
+                    .k
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                let want_k: Vec<f32> = pk.flatten_all().unwrap().to_vec1().unwrap();
+                assert_eq!(bk, want_k, "k mismatch layer {layer} block {b}");
+                let bv: Vec<f32> = bundle.blocks[b].layers[layer]
+                    .v
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                let want_v: Vec<f32> = pv.flatten_all().unwrap().to_vec1().unwrap();
+                assert_eq!(bv, want_v, "v mismatch layer {layer} block {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn export_prefix_bundle_rejects_unaligned_or_oversized_count() {
+        let cfg = prefix_config();
+        let mut cache = Cache::new(&cfg, DType::F32, &Device::Cpu).unwrap();
+        cache.reset_sequence();
+        cache.allocate_kv(32).unwrap();
+        write_zeros_for_current_batch(&mut cache, 32);
+        // Not block aligned.
+        assert!(cache.export_prefix_bundle("m", &[0; 32], 20).is_err());
+        // Exceeds live length.
+        assert!(cache.export_prefix_bundle("m", &[0; 48], 48).is_err());
     }
 
     #[test]
