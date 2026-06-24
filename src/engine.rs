@@ -4,9 +4,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use candle_core::{DType, Device, IndexOp, Tensor};
 
-use crate::distkv::client::DistKvClient;
-use crate::distkv::scheduler::{CacheScheduler, BLOCK_SIZE};
 use crate::distkv::worker::WorkerStore;
+use crate::kv_cache::distkv_store::DistKvObjectStore;
+use crate::kv_cache::local::LocalKvHandle;
+use crate::kv_cache::manager::KvCacheManager;
 use crate::loader::safetensors::load_var_builder;
 use crate::models::{
     self,
@@ -14,98 +15,6 @@ use crate::models::{
 };
 use crate::sampling::{apply_repeat_penalty, LogitsSampler, SamplingParams};
 use crate::tokenizer::{ChatMessage, ChatTemplate, Tokenizer};
-
-/// Blocking bridge from the synchronous engine to the async `DistKvClient`.
-///
-/// `Engine::generate` is synchronous and runs inside `spawn_blocking` on the
-/// server, so it cannot `.await`. This owns a dedicated current-thread runtime
-/// and drives the async client via `block_on`. Calling `block_on` is safe from
-/// a `spawn_blocking` worker because that thread is not an async context.
-pub struct RemoteKvCache {
-    client: DistKvClient,
-    runtime: tokio::runtime::Runtime,
-    /// Present in co-located mode: this node's own worker, accessed in-process
-    /// when a route resolves to it (read/write locality).
-    local: Option<LocalWorker>,
-}
-
-struct LocalWorker {
-    worker_id: String,
-    store: Arc<Mutex<WorkerStore>>,
-}
-
-impl RemoteKvCache {
-    /// Remote-only cache: every get/put flows over HTTP. Does not connect now;
-    /// failures surface lazily so the remote cache stays optional.
-    pub fn connect(master_url: &str) -> anyhow::Result<Self> {
-        Self::build(master_url, None)
-    }
-
-    /// Co-located cache: writes prefer the local worker and routes that resolve
-    /// to it are read directly from the in-process store.
-    pub fn connect_colocated(
-        master_url: &str,
-        worker_id: String,
-        store: Arc<Mutex<WorkerStore>>,
-    ) -> anyhow::Result<Self> {
-        Self::build(master_url, Some(LocalWorker { worker_id, store }))
-    }
-
-    fn build(master_url: &str, local: Option<LocalWorker>) -> anyhow::Result<Self> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        Ok(Self {
-            client: DistKvClient::new(master_url),
-            runtime,
-            local,
-        })
-    }
-
-    fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        self.runtime.block_on(async {
-            let route = match self.client.get_route(key).await? {
-                Some(r) => r,
-                None => return Ok(None),
-            };
-            match &self.local {
-                // Read locality: route points at our own worker -> in-process read.
-                Some(l) if l.worker_id == route.worker_id => l
-                    .store
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("local store poisoned"))?
-                    .get_bytes(key, route.object_generation),
-                _ => {
-                    self.client
-                        .fetch_worker(&route.worker_addr, key, route.object_generation)
-                        .await
-                }
-            }
-        })
-    }
-
-    fn put(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
-        self.runtime.block_on(async {
-            let preferred = self.local.as_ref().map(|l| l.worker_id.as_str());
-            let start = self.client.put_start(key, bytes.len(), preferred).await?;
-            match &self.local {
-                // Write locality: master pinned it to us -> in-process write.
-                Some(l) if l.worker_id == start.worker_id => {
-                    l.store
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("local store poisoned"))?
-                        .put_bytes(key.to_string(), start.object_generation, bytes)?;
-                }
-                _ => {
-                    self.client
-                        .write_worker(&start.worker_addr, key, start.object_generation, bytes)
-                        .await?;
-                }
-            }
-            self.client.put_commit(key, start.put_id).await
-        })
-    }
-}
 
 /// Parse a dtype name into a `DType`. Accepts both short forms (`f32`, `bf16`, `f16`) and the
 /// torch names found in `config.json` (`float32`, `bfloat16`, `float16`), case-insensitively.
@@ -170,10 +79,10 @@ pub struct Engine {
     device: Device,
     model_id: String,
     cache: std::sync::Mutex<Cache>,
-    /// Optional remote KV cache. Strictly best-effort: when unset or
-    /// unreachable, generation falls back to local prefill with no behavior
-    /// change.
-    remote_kv: Option<RemoteKvCache>,
+    /// Unified KV cache layer. Owns prefix keying, remote hit/miss, fallback,
+    /// and publish policy. Defaults to local-only; remote is strictly
+    /// best-effort and never changes inference correctness.
+    kv_cache: KvCacheManager,
 }
 
 impl Engine {
@@ -216,9 +125,9 @@ impl Engine {
             chat_template,
             eos_token_id,
             device,
-            model_id,
             cache,
-            remote_kv: None,
+            kv_cache: KvCacheManager::local_only(model_id.clone()),
+            model_id,
         })
     }
 
@@ -230,22 +139,23 @@ impl Engine {
     /// the Master need not be reachable now, and remote failures never abort
     /// generation.
     pub fn enable_remote_kv(&mut self, master_url: &str) -> anyhow::Result<()> {
-        self.remote_kv = Some(RemoteKvCache::connect(master_url)?);
+        let store = Arc::new(DistKvObjectStore::connect(master_url)?);
+        self.kv_cache = KvCacheManager::with_remote(self.model_id.clone(), store);
         Ok(())
     }
 
     /// Enables the remote KV cache in co-located mode: this node embeds the
     /// worker `worker_id` backed by `store`, so writes prefer it and local
-    /// routes are read in-process. Best-effort, like `enable_remote_kv`.
+    /// committed routes are read in-process. Best-effort, like `enable_remote_kv`.
     pub fn enable_remote_kv_colocated(
         &mut self,
         master_url: &str,
         worker_id: String,
         store: Arc<Mutex<WorkerStore>>,
     ) -> anyhow::Result<()> {
-        self.remote_kv = Some(RemoteKvCache::connect_colocated(
-            master_url, worker_id, store,
-        )?);
+        let local = LocalKvHandle::new(worker_id, store);
+        let store = Arc::new(DistKvObjectStore::connect_colocated(master_url, local)?);
+        self.kv_cache = KvCacheManager::with_remote(self.model_id.clone(), store);
         Ok(())
     }
 
@@ -262,21 +172,9 @@ impl Engine {
         // Remote KV cache lookup (best-effort). Records a hit/miss metric only;
         // the bytes are opaque for this milestone. A remote failure (e.g. Master
         // down) is treated as a miss so local prefill proceeds unchanged.
-        let remote_key = self
-            .remote_kv
-            .as_ref()
-            .map(|_| CacheScheduler::prefix_key(&self.model_id, &prompt_tokens, BLOCK_SIZE));
-        let remote_cache_hit = match (&self.remote_kv, &remote_key) {
-            (Some(remote), Some(key)) => Some(match remote.get(key) {
-                Ok(Some(_bytes)) => true,
-                Ok(None) => false,
-                Err(e) => {
-                    tracing::warn!("remote kv get failed, falling back to local prefill: {e}");
-                    false
-                }
-            }),
-            _ => None,
-        };
+        let lookup = self.kv_cache.prepare(&prompt_tokens);
+        let remote_cache_hit = lookup.remote_cache_hit;
+        let remote_key = lookup.remote_key.clone();
 
         let mut cache = self
             .cache
@@ -285,8 +183,12 @@ impl Engine {
         let mut sampler = LogitsSampler::new(params.seed);
         let mut all_tokens = prompt_tokens.clone();
 
-        let input = Tensor::new(prompt_tokens.as_slice(), &self.device)?.unsqueeze(0)?;
-        let (mut logits, reused_prefix_tokens) = self.model.prefill_cached(&input, &mut cache)?;
+        let mut kv_session = self
+            .kv_cache
+            .bind_session(lookup, &mut cache, prompt_tokens.clone());
+        let prefill = kv_session.prefill(&self.model, &self.device)?;
+        let mut logits = prefill.logits;
+        let reused_prefix_tokens = prefill.reused_prefix_tokens;
         let mut completion_tokens = 0usize;
 
         tracing::info!(
@@ -340,7 +242,9 @@ impl Engine {
             completion_tokens += 1;
 
             let next_input = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
-            logits = self.model.forward(&next_input, index_pos, &mut cache)?;
+            logits = self
+                .model
+                .forward(&next_input, index_pos, kv_session.cache_mut())?;
         }
 
         tracing::info!(
@@ -348,20 +252,12 @@ impl Engine {
             completion_tokens
         );
 
-        // Release the cache lock before any remote network I/O.
+        // Collect publish state, then release the cache lock before any remote
+        // network I/O. The publish is best-effort: a failure is logged and
+        // ignored so inference is never blocked on the remote cache.
+        let publish = kv_session.finish();
         drop(cache);
-
-        // Remote KV cache store (best-effort, async PUT after prefill). Stores an
-        // opaque object for this milestone; a failure is logged and ignored so
-        // inference is never blocked on the remote cache.
-        if let (Some(remote), Some(key)) = (&self.remote_kv, &remote_key) {
-            if CacheScheduler::should_store(prompt_len, reused_prefix_tokens) {
-                let bytes: Vec<u8> = prompt_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
-                if let Err(e) = remote.put(key, bytes) {
-                    tracing::warn!("remote kv put failed (ignored): {e}");
-                }
-            }
-        }
+        self.kv_cache.publish_best_effort(publish);
 
         Ok(GenerationStats {
             prompt_tokens: prompt_len,
@@ -686,6 +582,7 @@ pub(crate) mod tests {
 
     // --- Remote KV cache integration (Task 6) ---
 
+    use crate::distkv::client::DistKvClient;
     use crate::distkv::http::{master_router, worker_router};
     use crate::distkv::master::MasterState;
     use crate::distkv::protocol::RegisterRequest;
@@ -809,7 +706,7 @@ pub(crate) mod tests {
         std::mem::forget(engine);
     }
 
-    // --- Co-located RemoteKvCache: read/write locality (Task 4) ---
+    // --- Co-located KV cache: read/write locality ---
 
     /// Master + one worker registered under `worker_id`, advertising `advertise`.
     /// Pass an unroutable `advertise` to prove a path never used HTTP.
@@ -866,6 +763,26 @@ pub(crate) mod tests {
         // worker addr is unroutable, so a hit can only come from the local store).
         let second = run_generate(engine.clone()).await;
         assert_eq!(second.remote_cache_hit, Some(true));
+
+        std::mem::forget(engine);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn colocated_second_request_uses_committed_local_fast_path() {
+        let store = Arc::new(Mutex::new(WorkerStore::new("local".into(), 0, 1 << 20)));
+        let master_url = colocated_master("local", "http://127.0.0.1:1").await;
+        let mut engine = loaded_engine();
+        engine
+            .enable_remote_kv_colocated(&master_url, "local".into(), store.clone())
+            .unwrap();
+        let engine = Arc::new(Mutex::new(engine));
+
+        let first = run_generate(engine.clone()).await;
+        assert_eq!(first.remote_cache_hit, Some(false));
+
+        let second = run_generate(engine.clone()).await;
+        assert_eq!(second.remote_cache_hit, Some(true));
+        assert_eq!(first.remote_key, second.remote_key);
 
         std::mem::forget(engine);
     }

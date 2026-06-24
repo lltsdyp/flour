@@ -2,6 +2,7 @@ pub mod api;
 pub mod backend;
 pub mod distkv;
 pub mod engine;
+pub mod kv_cache;
 pub mod loader;
 pub mod models;
 pub mod sampling;

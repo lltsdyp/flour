@@ -9,6 +9,5 @@ pub mod http;
 pub mod master;
 pub mod protocol;
 pub mod registration;
-pub mod scheduler;
 pub mod test;
 pub mod worker;
