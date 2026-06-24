@@ -648,6 +648,74 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    /// Like `run_generate`, but also captures the decoded completion text so two engines'
+    /// greedy outputs can be compared.
+    async fn run_generate_capture(engine: Arc<Mutex<Engine>>) -> (GenerationStats, String) {
+        let params = crate::sampling::SamplingParams {
+            max_tokens: 4,
+            seed: 7,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        tokio::task::spawn_blocking(move || {
+            let mut out = String::new();
+            let stats = engine
+                .lock()
+                .unwrap()
+                .generate(&hi(), &params, |t| out.push_str(t))
+                .unwrap();
+            (stats, out)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// End-to-end proof of real cross-node KV reuse: engine A cold-prefills and publishes a real
+    /// bundle; engine B — a *separate* `Engine` with its own empty `Cache`, sharing only the
+    /// DistKV cluster — imports that bundle, reports a remote hit with a non-empty reused prefix,
+    /// and produces byte-identical greedy output. The two engines load from the same fixture dir
+    /// so they agree on model weights and `model_id` (hence the prefix key), but never share a
+    /// local `Cache`, so any reuse on B can only have come from the remote bundle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cross_node_reuses_real_remote_kv() {
+        let master_url = remote_cluster().await;
+        let dir = tests::fixture_dir_for_external_use();
+
+        // Engine A: cold-generate, publishing a real KV bundle to DistKV.
+        let mut engine_a = Engine::load(dir.path(), None).unwrap();
+        engine_a.enable_remote_kv(&master_url).unwrap();
+        let engine_a = Arc::new(Mutex::new(engine_a));
+        let (stats_a, out_a) = run_generate_capture(engine_a.clone()).await;
+        assert_eq!(stats_a.remote_cache_hit, Some(false), "A starts cold");
+        assert_eq!(stats_a.reused_prefix_tokens, 0, "A computed the whole prompt");
+
+        // Engine B: independent engine + cache; only DistKV is shared.
+        let mut engine_b = Engine::load(dir.path(), None).unwrap();
+        engine_b.enable_remote_kv(&master_url).unwrap();
+        let engine_b = Arc::new(Mutex::new(engine_b));
+        let (stats_b, out_b) = run_generate_capture(engine_b.clone()).await;
+
+        assert_eq!(
+            stats_b.remote_cache_hit,
+            Some(true),
+            "B hits the remote KV bundle"
+        );
+        assert!(
+            stats_b.reused_prefix_tokens > 0,
+            "B imports a real prefix from the remote bundle"
+        );
+        assert_eq!(
+            stats_a.remote_key, stats_b.remote_key,
+            "same model + prompt => same prefix key"
+        );
+        // Correctness: B's imported-prefix generation matches A's cold reference exactly.
+        assert_eq!(out_a, out_b, "imported KV must reproduce the cold output");
+
+        std::mem::forget(dir);
+        std::mem::forget(engine_a);
+        std::mem::forget(engine_b);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn generation_succeeds_when_master_is_down() {
         let mut engine = loaded_engine();
