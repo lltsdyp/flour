@@ -1,10 +1,12 @@
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use candle_core::{DType, Device, IndexOp, Tensor};
 
 use crate::distkv::client::DistKvClient;
 use crate::distkv::scheduler::{CacheScheduler, BLOCK_SIZE};
+use crate::distkv::worker::WorkerStore;
 use crate::loader::safetensors::load_var_builder;
 use crate::models::{
     self,
@@ -22,28 +24,86 @@ use crate::tokenizer::{ChatMessage, ChatTemplate, Tokenizer};
 pub struct RemoteKvCache {
     client: DistKvClient,
     runtime: tokio::runtime::Runtime,
+    /// Present in co-located mode: this node's own worker, accessed in-process
+    /// when a route resolves to it (read/write locality).
+    local: Option<LocalWorker>,
+}
+
+struct LocalWorker {
+    worker_id: String,
+    store: Arc<Mutex<WorkerStore>>,
 }
 
 impl RemoteKvCache {
-    /// Creates a remote cache handle for the given Master URL. This does not
-    /// connect; failures surface lazily on the first `get`/`put`, which keeps
-    /// the remote cache strictly optional (the Master may be down).
+    /// Remote-only cache: every get/put flows over HTTP. Does not connect now;
+    /// failures surface lazily so the remote cache stays optional.
     pub fn connect(master_url: &str) -> anyhow::Result<Self> {
+        Self::build(master_url, None)
+    }
+
+    /// Co-located cache: writes prefer the local worker and routes that resolve
+    /// to it are read directly from the in-process store.
+    pub fn connect_colocated(
+        master_url: &str,
+        worker_id: String,
+        store: Arc<Mutex<WorkerStore>>,
+    ) -> anyhow::Result<Self> {
+        Self::build(master_url, Some(LocalWorker { worker_id, store }))
+    }
+
+    fn build(master_url: &str, local: Option<LocalWorker>) -> anyhow::Result<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         Ok(Self {
             client: DistKvClient::new(master_url),
             runtime,
+            local,
         })
     }
 
     fn get(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        self.runtime.block_on(self.client.get_object(key))
+        self.runtime.block_on(async {
+            let route = match self.client.get_route(key).await? {
+                Some(r) => r,
+                None => return Ok(None),
+            };
+            match &self.local {
+                // Read locality: route points at our own worker -> in-process read.
+                Some(l) if l.worker_id == route.worker_id => l
+                    .store
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("local store poisoned"))?
+                    .get_bytes(key, route.object_generation),
+                _ => {
+                    self.client
+                        .fetch_worker(&route.worker_addr, key, route.object_generation)
+                        .await
+                }
+            }
+        })
     }
 
     fn put(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
-        self.runtime.block_on(self.client.put_object(key, bytes))
+        self.runtime.block_on(async {
+            let preferred = self.local.as_ref().map(|l| l.worker_id.as_str());
+            let start = self.client.put_start(key, bytes.len(), preferred).await?;
+            match &self.local {
+                // Write locality: master pinned it to us -> in-process write.
+                Some(l) if l.worker_id == start.worker_id => {
+                    l.store
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("local store poisoned"))?
+                        .put_bytes(key.to_string(), start.object_generation, bytes)?;
+                }
+                _ => {
+                    self.client
+                        .write_worker(&start.worker_addr, key, start.object_generation, bytes)
+                        .await?;
+                }
+            }
+            self.client.put_commit(key, start.put_id).await
+        })
     }
 }
 
@@ -171,6 +231,21 @@ impl Engine {
     /// generation.
     pub fn enable_remote_kv(&mut self, master_url: &str) -> anyhow::Result<()> {
         self.remote_kv = Some(RemoteKvCache::connect(master_url)?);
+        Ok(())
+    }
+
+    /// Enables the remote KV cache in co-located mode: this node embeds the
+    /// worker `worker_id` backed by `store`, so writes prefer it and local
+    /// routes are read in-process. Best-effort, like `enable_remote_kv`.
+    pub fn enable_remote_kv_colocated(
+        &mut self,
+        master_url: &str,
+        worker_id: String,
+        store: Arc<Mutex<WorkerStore>>,
+    ) -> anyhow::Result<()> {
+        self.remote_kv = Some(RemoteKvCache::connect_colocated(
+            master_url, worker_id, store,
+        )?);
         Ok(())
     }
 
@@ -613,6 +688,7 @@ pub(crate) mod tests {
 
     use crate::distkv::http::{master_router, worker_router};
     use crate::distkv::master::MasterState;
+    use crate::distkv::protocol::RegisterRequest;
     use crate::distkv::worker::WorkerStore;
     use std::sync::{Arc, Mutex};
 
@@ -729,6 +805,94 @@ pub(crate) mod tests {
             "second identical prompt should hit the remote cache"
         );
         assert_eq!(first.remote_key, second.remote_key);
+
+        std::mem::forget(engine);
+    }
+
+    // --- Co-located RemoteKvCache: read/write locality (Task 4) ---
+
+    /// Master + one worker registered under `worker_id`, advertising `advertise`.
+    /// Pass an unroutable `advertise` to prove a path never used HTTP.
+    async fn colocated_master(worker_id: &str, advertise: &str) -> String {
+        let master = Arc::new(Mutex::new(MasterState::new(|| 1_000)));
+        let master_url = spawn(master_router(master)).await;
+        reqwest::Client::new()
+            .post(format!("{master_url}/v1/distkv/workers/register"))
+            .json(&RegisterRequest {
+                worker_id: worker_id.into(),
+                addr: advertise.into(),
+                capacity_bytes: 1 << 20,
+            })
+            .send()
+            .await
+            .unwrap();
+        master_url
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn colocated_put_writes_to_local_store_without_http() {
+        let store = Arc::new(Mutex::new(WorkerStore::new("local".into(), 0, 1 << 20)));
+        // Unroutable advertise: any HTTP write would fail the test.
+        let master_url = colocated_master("local", "http://127.0.0.1:1").await;
+        let mut engine = loaded_engine();
+        engine
+            .enable_remote_kv_colocated(&master_url, "local".into(), store.clone())
+            .unwrap();
+        let engine = Arc::new(Mutex::new(engine));
+
+        let stats = run_generate(engine.clone()).await;
+        let key = stats.remote_key.clone().expect("remote enabled => key set");
+
+        // Bytes landed in the in-process store at generation 1, no HTTP involved.
+        let held = store.lock().unwrap().get_bytes(&key, 1).unwrap();
+        assert!(held.is_some(), "local store should hold the bundle");
+
+        std::mem::forget(engine);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn colocated_get_hits_local_store_without_http() {
+        let store = Arc::new(Mutex::new(WorkerStore::new("local".into(), 0, 1 << 20)));
+        let master_url = colocated_master("local", "http://127.0.0.1:1").await;
+        let mut engine = loaded_engine();
+        engine
+            .enable_remote_kv_colocated(&master_url, "local".into(), store.clone())
+            .unwrap();
+        let engine = Arc::new(Mutex::new(engine));
+
+        let first = run_generate(engine.clone()).await;
+        assert_eq!(first.remote_cache_hit, Some(false));
+        // Second identical prompt hits the cache via an in-process read (the
+        // worker addr is unroutable, so a hit can only come from the local store).
+        let second = run_generate(engine.clone()).await;
+        assert_eq!(second.remote_cache_hit, Some(true));
+
+        std::mem::forget(engine);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_route_still_uses_http() {
+        // Local store exists but is NOT registered with the Master; the only
+        // registered worker is a real remote HTTP worker. The route therefore
+        // points remote and must be served over HTTP.
+        let local = Arc::new(Mutex::new(WorkerStore::new("local".into(), 0, 1 << 20)));
+        let master_url = remote_cluster().await; // registers a real worker "w1"
+        let mut engine = loaded_engine();
+        engine
+            .enable_remote_kv_colocated(&master_url, "local".into(), local.clone())
+            .unwrap();
+        let engine = Arc::new(Mutex::new(engine));
+
+        let first = run_generate(engine.clone()).await;
+        assert_eq!(first.remote_cache_hit, Some(false));
+        let second = run_generate(engine.clone()).await;
+        assert_eq!(
+            second.remote_cache_hit,
+            Some(true),
+            "served over HTTP by w1"
+        );
+        // The local store was never the route target, so it stays empty.
+        assert_eq!(local.lock().unwrap().used_bytes(), 0);
 
         std::mem::forget(engine);
     }

@@ -230,6 +230,7 @@ mod tests {
             .json(&PutStartRequest {
                 key: key.into(),
                 size_bytes: payload.len(),
+                preferred_worker_id: None,
             })
             .send()
             .await

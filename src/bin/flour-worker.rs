@@ -8,21 +8,18 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use clap::Parser;
 use flour::distkv::http::worker_router;
-use flour::distkv::protocol::{HeartbeatRequest, RegisterRequest, RegisterResponse};
+use flour::distkv::protocol::RegisterRequest;
+use flour::distkv::registration::{heartbeat_once, register, HEARTBEAT_INTERVAL};
 use flour::distkv::worker::WorkerStore;
 
-/// How often to heartbeat. Must be well under the Master's heartbeat timeout
-/// (`HEARTBEAT_TIMEOUT_MS` = 10s) so a healthy worker is never marked dead.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
-/// Delay between registration retries while the Master is still unreachable.
-const REGISTER_RETRY: Duration = Duration::from_secs(2);
-
 #[derive(Parser, Debug)]
-#[command(name = "flour-worker", about = "Distributed KV cache Worker (object bytes)")]
+#[command(
+    name = "flour-worker",
+    about = "Distributed KV cache Worker (object bytes)"
+)]
 struct Args {
     /// Stable identity for this worker across restarts.
     #[arg(long)]
@@ -49,31 +46,6 @@ struct Args {
     capacity_bytes: usize,
 }
 
-/// Registers (or re-registers) with the Master, retrying until it succeeds.
-/// Returns the epoch the Master assigned to this registration.
-async fn register(
-    http: &reqwest::Client,
-    master_url: &str,
-    req: &RegisterRequest,
-) -> anyhow::Result<u64> {
-    loop {
-        match http
-            .post(format!("{master_url}/v1/distkv/workers/register"))
-            .json(req)
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                let reg: RegisterResponse = resp.json().await?;
-                return Ok(reg.epoch);
-            }
-            Ok(resp) => tracing::warn!("register rejected: {}", resp.status()),
-            Err(e) => tracing::warn!("master unreachable, retrying registration: {e}"),
-        }
-        tokio::time::sleep(REGISTER_RETRY).await;
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -94,7 +66,10 @@ async fn main() -> anyhow::Result<()> {
         args.capacity_bytes,
     )));
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
-    tracing::info!("distkv worker '{}' data path on http://{addr}", args.worker_id);
+    tracing::info!(
+        "distkv worker '{}' data path on http://{addr}",
+        args.worker_id
+    );
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let server = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, worker_router(store)).await {
@@ -110,24 +85,14 @@ async fn main() -> anyhow::Result<()> {
         capacity_bytes: args.capacity_bytes,
     };
     let mut epoch = register(&http, &master_url, &reg).await?;
-    tracing::info!("registered '{}' with master as epoch {epoch}", args.worker_id);
+    tracing::info!(
+        "registered '{}' with master as epoch {epoch}",
+        args.worker_id
+    );
 
     loop {
         tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-        let hb = HeartbeatRequest {
-            worker_id: args.worker_id.clone(),
-            epoch,
-        };
-        let ok = http
-            .post(format!("{master_url}/v1/distkv/workers/heartbeat"))
-            .json(&hb)
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
-        if !ok {
-            // Master lost our registration (likely a restart): re-register and
-            // adopt the new epoch.
+        if !heartbeat_once(&http, &master_url, &args.worker_id, epoch).await {
             tracing::warn!("heartbeat failed, re-registering with master");
             epoch = register(&http, &master_url, &reg).await?;
             tracing::info!("re-registered '{}' as epoch {epoch}", args.worker_id);

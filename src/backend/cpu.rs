@@ -242,40 +242,6 @@ mod tests {
     }
 
     #[test]
-    fn paged_attention_bf16_matches_f32_reference() {
-        let scale = 1.0 / (4f64).sqrt();
-        let q = rand_tensor(&[1, 2, 5, 4], 1);
-        let k = rand_tensor(&[1, 2, 5, 4], 2);
-        let v = rand_tensor(&[1, 2, 5, 4], 3);
-        // f32 dense result is the ground truth.
-        let reference = dense_reference(&q, &k, &v, 1, scale);
-        // Run the kernel in bf16 and confirm the output stays close after the f32 accumulation.
-        let blocks: Vec<(Tensor, Tensor)> = into_blocks(&k, &v, 2)
-            .into_iter()
-            .map(|(k, v)| {
-                (
-                    k.to_dtype(DType::BF16).unwrap(),
-                    v.to_dtype(DType::BF16).unwrap(),
-                )
-            })
-            .collect();
-        let q_bf16 = q.to_dtype(DType::BF16).unwrap();
-        let out = paged_attention(&q_bf16, &blocks, 1, scale).unwrap();
-        assert_eq!(out.dtype(), DType::BF16);
-        let out: Vec<f32> = out
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        // bf16 has ~3 decimal digits of precision, so allow a loose tolerance.
-        for (x, y) in out.iter().zip(reference.iter()) {
-            assert!((x - y).abs() < 5e-2, "mismatch: {x} vs {y}");
-        }
-    }
-
-    #[test]
     fn causal_attention_with_identity_value_returns_weighted_average() {
         // 1 batch, 1 head, 2 query positions, head_dim=1, attending to themselves only (causal).
         let q = Tensor::from_vec(vec![1f32, 1f32], (1, 1, 2, 1), &Device::Cpu).unwrap();

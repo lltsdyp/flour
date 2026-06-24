@@ -51,6 +51,8 @@ pub struct HeartbeatRequest {
 pub struct PutStartRequest {
     pub key: ObjectKey,
     pub size_bytes: usize,
+    #[serde(default)]
+    pub preferred_worker_id: Option<WorkerId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -139,7 +141,25 @@ mod tests {
         round_trip(&PutStartRequest {
             key: "kv://v1/model/m/prefix/abc/tokens/64".to_string(),
             size_bytes: 4096,
+            preferred_worker_id: None,
         });
+    }
+
+    #[test]
+    fn put_start_request_round_trips_with_preferred_worker() {
+        round_trip(&PutStartRequest {
+            key: "k".to_string(),
+            size_bytes: 4096,
+            preferred_worker_id: Some("w1".to_string()),
+        });
+    }
+
+    #[test]
+    fn put_start_request_legacy_json_defaults_preferred_to_none() {
+        // JSON written by an older peer that predates preferred_worker_id.
+        let legacy = r#"{"key":"k","size_bytes":4096}"#;
+        let req: PutStartRequest = serde_json::from_str(legacy).expect("deserialize legacy");
+        assert_eq!(req.preferred_worker_id, None);
     }
 
     #[test]

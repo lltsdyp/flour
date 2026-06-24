@@ -42,9 +42,15 @@ pub fn mount_distkv(
 }
 
 pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> anyhow::Result<()> {
+    serve_router(router(state), addr).await
+}
+
+/// Serves a fully-built router (used when extra routes such as the co-located
+/// worker data path have already been merged in).
+pub async fn serve_router(app: Router, addr: std::net::SocketAddr) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("listening on http://{addr}");
-    axum::serve(listener, router(state)).await?;
+    axum::serve(listener, app).await?;
     Ok(())
 }
 
@@ -102,5 +108,56 @@ mod tests {
         let json: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(json["object"], "chat.completion");
         assert!(json["choices"][0]["message"]["content"].is_string());
+    }
+
+    #[tokio::test]
+    async fn one_server_serves_api_and_worker_data_path() {
+        let dir = crate::engine::tests::fixture_dir_for_external_use();
+        let engine = Engine::load(dir.path(), None).unwrap();
+        std::mem::forget(dir);
+        let state = AppState {
+            engine: Arc::new(Mutex::new(engine)),
+            started_at: 0,
+        };
+        let store = Arc::new(Mutex::new(crate::distkv::worker::WorkerStore::new(
+            "local".into(),
+            0,
+            1 << 20,
+        )));
+        let app = mount_distkv(router(state), None, Some(store));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let http = reqwest::Client::new();
+        // OpenAI API on this server.
+        let models = http
+            .get(format!("http://{addr}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(models.status(), 200);
+        // Worker data path on the SAME server: PUT then GET round-trips bytes.
+        let put = http
+            .put(format!(
+                "http://{addr}/v1/distkv/worker/objects/k?generation=1"
+            ))
+            .body(vec![1u8, 2, 3])
+            .send()
+            .await
+            .unwrap();
+        assert!(put.status().is_success());
+        let got = http
+            .get(format!(
+                "http://{addr}/v1/distkv/worker/objects/k?generation=1"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(got.status(), 200);
+        assert_eq!(got.bytes().await.unwrap().as_ref(), &[1u8, 2, 3]);
     }
 }

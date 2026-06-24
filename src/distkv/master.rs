@@ -144,13 +144,21 @@ impl MasterState {
             }
         }
 
-        // Pick the alive worker with the most free space that can fit the object.
-        let chosen = self
-            .workers
-            .iter()
-            .filter(|(_, w)| self.worker_is_alive(w, now) && w.free_bytes() >= req.size_bytes)
-            .max_by_key(|(_, w)| w.free_bytes())
-            .map(|(id, _)| id.clone());
+        // Write locality: honor a usable preferred worker; otherwise pick the
+        // alive worker with the most free space that can fit the object.
+        let preferred = req.preferred_worker_id.as_ref().and_then(|id| {
+            self.workers.get(id).and_then(|w| {
+                (self.worker_is_alive(w, now) && w.free_bytes() >= req.size_bytes)
+                    .then(|| id.clone())
+            })
+        });
+        let chosen = preferred.or_else(|| {
+            self.workers
+                .iter()
+                .filter(|(_, w)| self.worker_is_alive(w, now) && w.free_bytes() >= req.size_bytes)
+                .max_by_key(|(_, w)| w.free_bytes())
+                .map(|(id, _)| id.clone())
+        });
 
         let worker_id = chosen
             .ok_or_else(|| anyhow::anyhow!("no alive worker has {} free bytes", req.size_bytes))?;
@@ -269,6 +277,7 @@ mod tests {
             .put_start(PutStartRequest {
                 key: "k".into(),
                 size_bytes: 128,
+                preferred_worker_id: None,
             })
             .unwrap();
         assert_eq!(resp.worker_id, "w1");
@@ -286,6 +295,7 @@ mod tests {
             .put_start(PutStartRequest {
                 key: "k".into(),
                 size_bytes: 128,
+                preferred_worker_id: None,
             })
             .unwrap();
 
@@ -308,6 +318,7 @@ mod tests {
         m.put_start(PutStartRequest {
             key: "k".into(),
             size_bytes: 128,
+            preferred_worker_id: None,
         })
         .unwrap();
 
@@ -331,6 +342,7 @@ mod tests {
             .put_start(PutStartRequest {
                 key: "k".into(),
                 size_bytes: 128,
+                preferred_worker_id: None,
             })
             .unwrap();
         m.put_commit(PutCommitRequest {
@@ -353,8 +365,53 @@ mod tests {
             .put_start(PutStartRequest {
                 key: "k".into(),
                 size_bytes: 200,
+                preferred_worker_id: None,
             })
             .unwrap_err();
         assert!(err.to_string().contains("free bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn put_start_honors_preferred_worker() {
+        let mut m = master_at(1000);
+        // w_big has more free space, so without a preference it would be chosen.
+        m.register_worker("w_big".into(), "http://w_big".into(), 1 << 20);
+        m.register_worker("w_pref".into(), "http://w_pref".into(), 1 << 18);
+
+        let resp = m
+            .put_start(PutStartRequest {
+                key: "k".into(),
+                size_bytes: 128,
+                preferred_worker_id: Some("w_pref".into()),
+            })
+            .unwrap();
+        assert_eq!(resp.worker_id, "w_pref");
+    }
+
+    #[test]
+    fn put_start_falls_back_when_preferred_full_or_dead() {
+        let mut m = master_at(1000);
+        m.register_worker("w_other".into(), "http://w_other".into(), 1 << 20);
+        m.register_worker("w_pref".into(), "http://w_pref".into(), 100);
+
+        // Preferred worker cannot fit the object -> fall back to capacity choice.
+        let resp = m
+            .put_start(PutStartRequest {
+                key: "k".into(),
+                size_bytes: 200,
+                preferred_worker_id: Some("w_pref".into()),
+            })
+            .unwrap();
+        assert_eq!(resp.worker_id, "w_other");
+
+        // Unknown preferred worker -> fall back as well.
+        let resp2 = m
+            .put_start(PutStartRequest {
+                key: "k2".into(),
+                size_bytes: 128,
+                preferred_worker_id: Some("ghost".into()),
+            })
+            .unwrap();
+        assert_eq!(resp2.worker_id, "w_other");
     }
 }

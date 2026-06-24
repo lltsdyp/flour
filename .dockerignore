@@ -1,0 +1,13 @@
+# Keep the Docker build context small. The cluster image (examples/cluster/Dockerfile)
+# only needs Cargo.toml, Cargo.lock, and src/ — everything below is excluded from the
+# context sent to the daemon. Without this, the ~21G models/ and ~9G target/ dirs would
+# be uploaded on every `docker compose ... build`.
+target/
+models/
+.git/
+.superpowers/
+docs/
+script/
+*.md
+
+# examples/ is intentionally NOT ignored: it contains the Dockerfile and smoke-test.sh.

@@ -1,12 +1,10 @@
-# Simplest distributed KV cache cluster for flour:
-#   1 Master (metadata) + 2 Workers (object bytes) + 1 optional engine node.
+# Co-located distributed KV cache cluster for flour:
+#   1 Master (metadata) + 2 co-located nodes (each node = engine + worker in
+#   one process/port).
 #
-# Bring up just the KV cluster (Master + Workers):
-#   docker compose -f examples/cluster/docker-compose.yml up --build
-#
-# Also start the inference engine wired to the cluster (needs a model on disk):
+# Bring it up (needs a model on disk):
 #   MODEL_DIR=/abs/path/to/model \
-#     docker compose -f examples/cluster/docker-compose.yml --profile engine up --build
+#     docker compose -f examples/cluster/docker-compose.yml up --build
 #
 # All services share one image, so the build runs only once.
 
@@ -26,53 +24,48 @@ services:
     ports:
       - "8081:8081" # metadata path, handy for curl smoke tests
 
-  worker1:
+  # Co-located nodes: each runs the engine AND an embedded worker in one
+  # process/port. Mount a model dir via MODEL_DIR.
+  node1:
     <<: *flour-build
-    command:
-      - flour-worker
-      - --worker-id=worker1
-      - --master-url=http://master:8081
-      - --advertise-url=http://worker1:8090
-      - --port=8090
-      - --capacity-bytes=1073741824 # 1 GiB
-    environment:
-      RUST_LOG: info
-    depends_on:
-      - master
-
-  worker2:
-    <<: *flour-build
-    command:
-      - flour-worker
-      - --worker-id=worker2
-      - --master-url=http://master:8081
-      - --advertise-url=http://worker2:8090
-      - --port=8090
-      - --capacity-bytes=1073741824 # 1 GiB
-    environment:
-      RUST_LOG: info
-    depends_on:
-      - master
-
-  # Optional: an inference node that uses the cluster as a remote KV cache.
-  # Enabled only with `--profile engine`. Mount a model dir via MODEL_DIR.
-  engine:
-    <<: *flour-build
-    profiles: ["engine"]
     command:
       - flour
       - --model-dir=/models
+      - --dtype=f16
       - --host=0.0.0.0
       - --port=8080
-      - --remote-kv-enabled
+      - --colocated-worker
+      - --worker-id=node1
+      - --advertise-url=http://node1:8080
       - --remote-kv-master-url=http://master:8081
+      - --distkv-capacity-bytes=1073741824
     environment:
       RUST_LOG: info
     volumes:
       - ${MODEL_DIR:-./model}:/models:ro
     ports:
-      - "8080:8080" # OpenAI-compatible API
+      - "8080:8080"
     depends_on:
       - master
-      - worker1
-      - worker2
+
+  node2:
+    <<: *flour-build
+    command:
+      - flour
+      - --model-dir=/models
+      - --dtype=f16
+      - --host=0.0.0.0
+      - --port=8080
+      - --colocated-worker
+      - --worker-id=node2
+      - --advertise-url=http://node2:8080
+      - --remote-kv-master-url=http://master:8081
+      - --distkv-capacity-bytes=1073741824
+    environment:
+      RUST_LOG: info
+    volumes:
+      - ${MODEL_DIR:-./model}:/models:ro
+    ports:
+      - "8082:8080" # node1 already owns host 8080; node2 published on 8082
+    depends_on:
+      - master

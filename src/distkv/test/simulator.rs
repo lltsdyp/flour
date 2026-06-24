@@ -115,6 +115,7 @@ impl Sim {
             .put_start(PutStartRequest {
                 key: key.to_string(),
                 size_bytes: size,
+                preferred_worker_id: None,
             })
             .ok()?;
         self.marker = self.marker.wrapping_add(1);

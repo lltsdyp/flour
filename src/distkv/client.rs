@@ -28,30 +28,40 @@ impl DistKvClient {
         }
     }
 
-    /// Two-phase PUT of `bytes` under `key`.
-    ///
-    /// 1. `put_start` → Master picks a Worker and opens a write.
-    /// 2. bytes are written DIRECTLY to that Worker (never via the Master).
-    /// 3. `put_commit` → Master publishes the object as `Complete`.
-    pub async fn put_object(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
-        let start: PutStartResponse = self
-            .post_json(
-                "/v1/distkv/put_start",
-                &PutStartRequest {
-                    key: key.to_string(),
-                    size_bytes: bytes.len(),
-                },
-            )
-            .await?;
+    /// Phase 1 of PUT: ask the Master to open a write, optionally pinning the
+    /// object to `preferred_worker_id` (write locality).
+    pub async fn put_start(
+        &self,
+        key: &str,
+        size_bytes: usize,
+        preferred_worker_id: Option<&str>,
+    ) -> anyhow::Result<PutStartResponse> {
+        self.post_json(
+            "/v1/distkv/put_start",
+            &PutStartRequest {
+                key: key.to_string(),
+                size_bytes,
+                preferred_worker_id: preferred_worker_id.map(|s| s.to_string()),
+            },
+        )
+        .await
+    }
 
-        // Data path: bytes go straight to the Worker, keyed by generation.
+    /// Writes object bytes directly to a Worker's data path (never via Master).
+    pub async fn write_worker(
+        &self,
+        worker_addr: &str,
+        key: &str,
+        generation: u64,
+        bytes: Vec<u8>,
+    ) -> anyhow::Result<()> {
         let put = self
             .http
             .put(format!(
                 "{}/v1/distkv/worker/objects/{}?generation={}",
-                start.worker_addr.trim_end_matches('/'),
+                worker_addr.trim_end_matches('/'),
                 encode_segment(key),
-                start.object_generation
+                generation
             ))
             .body(bytes)
             .send()
@@ -59,13 +69,17 @@ impl DistKvClient {
         if !put.status().is_success() {
             anyhow::bail!("worker write failed with status {}", put.status());
         }
+        Ok(())
+    }
 
+    /// Phase 2 of PUT: publish the object as `Complete`.
+    pub async fn put_commit(&self, key: &str, put_id: PutId) -> anyhow::Result<()> {
         let commit = self
             .http
             .post(format!("{}/v1/distkv/put_commit", self.master_url))
             .json(&PutCommitRequest {
                 key: key.to_string(),
-                put_id: start.put_id,
+                put_id,
             })
             .send()
             .await?;
@@ -75,12 +89,8 @@ impl DistKvClient {
         Ok(())
     }
 
-    /// Looks up a route for `key` and fetches the bytes directly from the Worker.
-    ///
-    /// Returns `Ok(None)` on a clean miss: the Master has no readable route, or
-    /// the Worker no longer holds that generation (a safe miss, never stale
-    /// bytes — see Deep Bugs 2 and 3).
-    pub async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    /// Looks up a read route for `key`. `Ok(None)` is a clean miss.
+    pub async fn get_route(&self, key: &str) -> anyhow::Result<Option<GetRouteResponse>> {
         let route_resp = self
             .http
             .get(format!("{}/v1/distkv/get_route", self.master_url))
@@ -93,15 +103,24 @@ impl DistKvClient {
         if !route_resp.status().is_success() {
             anyhow::bail!("get_route failed with status {}", route_resp.status());
         }
-        let route: GetRouteResponse = route_resp.json().await?;
+        Ok(Some(route_resp.json().await?))
+    }
 
+    /// Fetches object bytes directly from a Worker. `Ok(None)` if that
+    /// generation no longer exists (a safe miss, never stale bytes).
+    pub async fn fetch_worker(
+        &self,
+        worker_addr: &str,
+        key: &str,
+        generation: u64,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
         let fetched = self
             .http
             .get(format!(
                 "{}/v1/distkv/worker/objects/{}?generation={}",
-                route.worker_addr.trim_end_matches('/'),
+                worker_addr.trim_end_matches('/'),
                 encode_segment(key),
-                route.object_generation
+                generation
             ))
             .send()
             .await?;
@@ -112,6 +131,24 @@ impl DistKvClient {
             anyhow::bail!("worker fetch failed with status {}", fetched.status());
         }
         Ok(Some(fetched.bytes().await?.to_vec()))
+    }
+
+    /// Two-phase PUT over HTTP (no locality). Bytes go straight to the Worker.
+    pub async fn put_object(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
+        let start = self.put_start(key, bytes.len(), None).await?;
+        self.write_worker(&start.worker_addr, key, start.object_generation, bytes)
+            .await?;
+        self.put_commit(key, start.put_id).await
+    }
+
+    /// Route lookup + direct Worker fetch over HTTP (no locality).
+    pub async fn get_object(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let route = match self.get_route(key).await? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        self.fetch_worker(&route.worker_addr, key, route.object_generation)
+            .await
     }
 
     async fn post_json<Req, Resp>(&self, path: &str, body: &Req) -> anyhow::Result<Resp>
@@ -203,5 +240,13 @@ mod tests {
         let client = cluster().await;
         let got = client.get_object("kv://nope").await.unwrap();
         assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn put_start_routes_to_preferred_worker() {
+        let client = cluster().await; // registers worker "w1"
+        let start = client.put_start("kv://k", 128, Some("w1")).await.unwrap();
+        assert_eq!(start.worker_id, "w1");
+        assert_eq!(start.object_generation, 1);
     }
 }
