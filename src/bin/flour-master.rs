@@ -14,7 +14,10 @@ use flour::distkv::http::master_router;
 use flour::distkv::master::MasterState;
 
 #[derive(Parser, Debug)]
-#[command(name = "flour-master", about = "Distributed KV cache Master (metadata only)")]
+#[command(
+    name = "flour-master",
+    about = "Distributed KV cache Master (metadata only)"
+)]
 struct Args {
     /// Address to bind the metadata HTTP server to.
     #[arg(long, default_value = "0.0.0.0")]

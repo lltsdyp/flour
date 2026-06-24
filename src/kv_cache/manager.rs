@@ -220,6 +220,11 @@ impl<'a> KvSession<'a> {
         self.cache
     }
 
+    /// Whether the remote KV cache is enabled for this session (vs. local-only).
+    pub fn remote_enabled(&self) -> bool {
+        self.remote_store.is_some()
+    }
+
     pub fn remote_cache_hit(&self) -> Option<bool> {
         self.remote_cache_hit
     }

@@ -347,7 +347,7 @@ mod tests {
         let b = alloc.allocate().unwrap();
         assert_ne!(a, b);
         assert_eq!(alloc.allocate(), None);
-        assert_eq!(alloc.decref(a), true);
+        assert!(alloc.decref(a));
         assert_eq!(alloc.num_free(), 1);
         assert_eq!(alloc.allocate(), Some(a));
     }
@@ -363,11 +363,11 @@ mod tests {
         // A second reference keeps the block live across one decref.
         alloc.incref(a);
         assert_eq!(alloc.ref_count(a), 2);
-        assert_eq!(alloc.decref(a), false); // still referenced
+        assert!(!alloc.decref(a)); // still referenced
         assert_eq!(alloc.num_free(), 1);
 
         // Final decref frees it back to the pool.
-        assert_eq!(alloc.decref(a), true);
+        assert!(alloc.decref(a));
         assert_eq!(alloc.ref_count(a), 0);
         assert_eq!(alloc.num_free(), 2);
         // Freed block can be hander out again.

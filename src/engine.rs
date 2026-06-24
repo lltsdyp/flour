@@ -69,6 +69,13 @@ pub struct GenerationStats {
     /// The prefix object key used for the remote cache, when enabled. Exposed
     /// for metrics and observability.
     pub remote_key: Option<String>,
+    /// Tokens imported from a real remote KV bundle for this request. `Some(0)`
+    /// on a remote miss (or a hit the local cache already covered), `None` when
+    /// the remote cache is disabled.
+    pub remote_cache_imported_tokens: Option<usize>,
+    /// A remote KV decode/import/fetch error that triggered a safe fallback to
+    /// local/cold prefill, if one occurred. `None` on success or when disabled.
+    pub remote_cache_error: Option<String>,
 }
 
 pub struct Engine {
@@ -189,6 +196,14 @@ impl Engine {
         let reused_prefix_tokens = prefill.reused_prefix_tokens;
         // The hit/miss metric is known only after prefill performed (or skipped) the remote fetch.
         let remote_cache_hit = kv_session.remote_cache_hit();
+        let (remote_cache_imported_tokens, remote_cache_error) = if kv_session.remote_enabled() {
+            (
+                Some(kv_session.remote_imported_tokens()),
+                kv_session.remote_error(),
+            )
+        } else {
+            (None, None)
+        };
         let mut completion_tokens = 0usize;
 
         tracing::info!(
@@ -266,6 +281,8 @@ impl Engine {
             finish_reason,
             remote_cache_hit,
             remote_key,
+            remote_cache_imported_tokens,
+            remote_cache_error,
         })
     }
 }
@@ -687,7 +704,10 @@ pub(crate) mod tests {
         let engine_a = Arc::new(Mutex::new(engine_a));
         let (stats_a, out_a) = run_generate_capture(engine_a.clone()).await;
         assert_eq!(stats_a.remote_cache_hit, Some(false), "A starts cold");
-        assert_eq!(stats_a.reused_prefix_tokens, 0, "A computed the whole prompt");
+        assert_eq!(
+            stats_a.reused_prefix_tokens, 0,
+            "A computed the whole prompt"
+        );
 
         // Engine B: independent engine + cache; only DistKV is shared.
         let mut engine_b = Engine::load(dir.path(), None).unwrap();
@@ -704,12 +724,95 @@ pub(crate) mod tests {
             stats_b.reused_prefix_tokens > 0,
             "B imports a real prefix from the remote bundle"
         );
+        // Stats wiring on a successful import: imported tokens reported, no error.
+        assert_eq!(
+            stats_b.remote_cache_imported_tokens,
+            Some(stats_b.reused_prefix_tokens)
+        );
+        assert_eq!(stats_b.remote_cache_error, None);
         assert_eq!(
             stats_a.remote_key, stats_b.remote_key,
             "same model + prompt => same prefix key"
         );
         // Correctness: B's imported-prefix generation matches A's cold reference exactly.
         assert_eq!(out_a, out_b, "imported KV must reproduce the cold output");
+
+        std::mem::forget(dir);
+        std::mem::forget(engine_a);
+        std::mem::forget(engine_b);
+    }
+
+    #[test]
+    fn stats_remote_disabled_has_no_remote_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture_model(dir.path());
+        let engine = Engine::load(dir.path(), None).unwrap();
+        let params = crate::sampling::SamplingParams {
+            max_tokens: 4,
+            seed: 7,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let stats = engine.generate(&hi(), &params, |_| {}).unwrap();
+        assert_eq!(stats.remote_cache_hit, None);
+        assert_eq!(stats.remote_cache_imported_tokens, None);
+        assert_eq!(stats.remote_cache_error, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stats_remote_miss_reports_zero_imported_and_no_error() {
+        let master_url = remote_cluster().await;
+        let mut engine = loaded_engine();
+        engine.enable_remote_kv(&master_url).unwrap();
+        let engine = Arc::new(Mutex::new(engine));
+
+        let stats = run_generate(engine.clone()).await;
+        assert_eq!(stats.remote_cache_hit, Some(false));
+        assert_eq!(stats.remote_cache_imported_tokens, Some(0));
+        assert_eq!(stats.remote_cache_error, None);
+
+        std::mem::forget(engine);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stats_remote_decode_failure_falls_back_with_error() {
+        let master_url = remote_cluster().await;
+        let dir = tests::fixture_dir_for_external_use();
+
+        // Engine A publishes a valid bundle so we can learn the prefix key.
+        let mut engine_a = Engine::load(dir.path(), None).unwrap();
+        engine_a.enable_remote_kv(&master_url).unwrap();
+        let engine_a = Arc::new(Mutex::new(engine_a));
+        let stats_a = run_generate(engine_a.clone()).await;
+        let key = stats_a.remote_key.clone().expect("remote enabled => key");
+
+        // Overwrite that key with bytes that are not a valid bundle (bad magic).
+        let client = DistKvClient::new(master_url.clone());
+        client
+            .put_object(&key, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+            .await
+            .unwrap();
+
+        // Engine B fetches the corrupt object, fails to decode, and falls back to cold prefill.
+        let mut engine_b = Engine::load(dir.path(), None).unwrap();
+        engine_b.enable_remote_kv(&master_url).unwrap();
+        let engine_b = Arc::new(Mutex::new(engine_b));
+        let stats_b = run_generate(engine_b.clone()).await;
+
+        assert_eq!(
+            stats_b.remote_cache_hit,
+            Some(false),
+            "a corrupt bundle counts as a miss"
+        );
+        assert_eq!(stats_b.remote_cache_imported_tokens, Some(0));
+        assert!(
+            stats_b.remote_cache_error.is_some(),
+            "decode failure must be recorded"
+        );
+        assert!(
+            stats_b.completion_tokens > 0,
+            "generation still succeeds via fallback"
+        );
 
         std::mem::forget(dir);
         std::mem::forget(engine_a);

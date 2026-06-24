@@ -278,6 +278,8 @@ mod tests {
             finish_reason: FinishReason::Stop,
             remote_cache_hit: None,
             remote_key: None,
+            remote_cache_imported_tokens: None,
+            remote_cache_error: None,
         };
         let resp = ChatCompletionResponse::new("flour".into(), "hello".into(), &stats);
         let json = serde_json::to_value(&resp).unwrap();
@@ -295,6 +297,8 @@ mod tests {
             finish_reason: FinishReason::Length,
             remote_cache_hit: None,
             remote_key: None,
+            remote_cache_imported_tokens: None,
+            remote_cache_error: None,
         };
         let resp = ChatCompletionResponse::new("flour".into(), "hi".into(), &stats);
         let json = serde_json::to_value(&resp).unwrap();

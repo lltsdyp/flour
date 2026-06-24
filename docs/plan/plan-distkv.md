@@ -812,3 +812,16 @@ AI 用于：
 * 不做高可用 Master。
 * 不做跨模型共享 KV。
 * 不追求性能指标；第一版追求可解释、可测试、可证明基本安全。
+
+## 附录：真实 KV Cache 跨节点复用（已实现）
+
+第一版 DistKV 只把不透明 bytes（prompt token ids）写入 object store，用于验证 PUT/GET 路由与命中指标。后续里程碑实现了**真实** paged KV blocks 的导出/导入：
+
+* `src/kv_cache/bundle.rs` 定义 `KvBundle` 与 `KvBundleCodec`（`FLKV` 魔数 + JSON header + 原始张量 bytes，支持 CPU f32/f16/bf16）。
+* `Cache::export_prefix_bundle` / `import_prefix_bundle` 在 `PagedKvPool` 上读写真实 K/V，并复用 `PrefixRegistry` 的 chained `block_hash` 注册逻辑。
+* `CausalLM::prefill_suffix` 只对未命中的 suffix 做 forward；`KvSession::prefill` 在拿到 mutable `Cache` 后再 GET/decode/import，导入失败安全回退到本地/冷启动。
+* `KvSession::finish` 在 cache 仍被借用时导出并编码 bundle，释放 cache 锁后由 `publish_best_effort` 执行 PUT。
+
+关键不变量：cache 只能提供 attention history，无法给出最后一个 prompt token 的 logits，所以 `reusable_token_count(prompt_len)` 取**严格小于** `prompt_len` 的最大 `BLOCK_SIZE` 倍数，至少保留 1 个 suffix token。Master/Worker 的 byte-object 语义、generation、两阶段 PUT 均保持不变。
+
+设计细节见 [`docs/superpowers/specs/2026-06-24-real-distributed-kv-cache-design.md`](../superpowers/specs/2026-06-24-real-distributed-kv-cache-design.md)。

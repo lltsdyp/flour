@@ -108,7 +108,7 @@ impl KvBundleCodec {
     pub fn encode(bundle: &KvBundle) -> anyhow::Result<Vec<u8>> {
         let meta = &bundle.meta;
         let num_blocks = meta.token_count / meta.block_size.max(1);
-        if meta.block_size == 0 || meta.token_count % meta.block_size != 0 {
+        if meta.block_size == 0 || !meta.token_count.is_multiple_of(meta.block_size) {
             anyhow::bail!("bundle token_count {} not block aligned", meta.token_count);
         }
         if bundle.blocks.len() != num_blocks {
@@ -164,7 +164,7 @@ impl KvBundleCodec {
         if meta.block_size == 0 {
             anyhow::bail!("bundle block_size is zero");
         }
-        if meta.token_count == 0 || meta.token_count % meta.block_size != 0 {
+        if meta.token_count == 0 || !meta.token_count.is_multiple_of(meta.block_size) {
             anyhow::bail!(
                 "bundle token_count {} not block aligned to {}",
                 meta.token_count,
@@ -197,9 +197,11 @@ impl KvBundleCodec {
         for b in 0..num_blocks {
             let mut layers = Vec::with_capacity(meta.num_layers);
             for _ in 0..meta.num_layers {
-                let k = le_bytes_to_tensor(&payload[off..off + bytes_per_tensor], meta.dtype, shape)?;
+                let k =
+                    le_bytes_to_tensor(&payload[off..off + bytes_per_tensor], meta.dtype, shape)?;
                 off += bytes_per_tensor;
-                let v = le_bytes_to_tensor(&payload[off..off + bytes_per_tensor], meta.dtype, shape)?;
+                let v =
+                    le_bytes_to_tensor(&payload[off..off + bytes_per_tensor], meta.dtype, shape)?;
                 off += bytes_per_tensor;
                 layers.push(KvLayerBlock { k, v });
             }
@@ -407,6 +409,9 @@ mod tests {
             .unwrap()
             .to_vec1()
             .unwrap();
-        assert_eq!(got, vec![half::f16::from_f32(1.5), half::f16::from_f32(-2.0)]);
+        assert_eq!(
+            got,
+            vec![half::f16::from_f32(1.5), half::f16::from_f32(-2.0)]
+        );
     }
 }

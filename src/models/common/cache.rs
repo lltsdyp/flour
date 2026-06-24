@@ -170,7 +170,7 @@ impl KvCache {
         token_count: usize,
     ) -> Result<KvBundle> {
         let bs = self.table.block_size();
-        if token_count == 0 || token_count % bs != 0 {
+        if token_count == 0 || !token_count.is_multiple_of(bs) {
             candle_core::bail!("export token_count {token_count} not aligned to block size {bs}");
         }
         if token_count > self.table.len() {
@@ -273,7 +273,7 @@ impl KvCache {
         if BundleDType::from_candle(self.pool.dtype()) != Some(meta.dtype) {
             candle_core::bail!("bundle dtype {:?} != model dtype", meta.dtype);
         }
-        if meta.token_count == 0 || meta.token_count % bs != 0 {
+        if meta.token_count == 0 || !meta.token_count.is_multiple_of(bs) {
             candle_core::bail!("bundle token_count {} not block aligned", meta.token_count);
         }
         if meta.token_ids.len() != meta.token_count {
@@ -481,7 +481,8 @@ impl Cache {
         token_ids: &[u32],
         token_count: usize,
     ) -> Result<KvBundle> {
-        self.kvs.export_prefix_bundle(model_id, token_ids, token_count)
+        self.kvs
+            .export_prefix_bundle(model_id, token_ids, token_count)
     }
 
     /// Import a remote [`KvBundle`] into a fresh sequence and register its blocks for reuse.
@@ -738,12 +739,10 @@ mod tests {
             let n = kv_heads * 32 * head_dim;
             let kdata: Vec<f32> = (0..n).map(|i| (layer * 1000 + i) as f32).collect();
             let vdata: Vec<f32> = kdata.iter().map(|x| x + 0.25).collect();
-            let k =
-                candle_core::Tensor::from_vec(kdata, (1, kv_heads, 32, head_dim), &Device::Cpu)
-                    .unwrap();
-            let v =
-                candle_core::Tensor::from_vec(vdata, (1, kv_heads, 32, head_dim), &Device::Cpu)
-                    .unwrap();
+            let k = candle_core::Tensor::from_vec(kdata, (1, kv_heads, 32, head_dim), &Device::Cpu)
+                .unwrap();
+            let v = candle_core::Tensor::from_vec(vdata, (1, kv_heads, 32, head_dim), &Device::Cpu)
+                .unwrap();
             cache.write_kv(layer, &k, &v).unwrap();
         }
 
@@ -795,12 +794,10 @@ mod tests {
             let n = kv_heads * 32 * head_dim;
             let kdata: Vec<f32> = (0..n).map(|i| (layer * 1000 + i) as f32 + 0.125).collect();
             let vdata: Vec<f32> = kdata.iter().map(|x| x + 0.5).collect();
-            let k =
-                candle_core::Tensor::from_vec(kdata, (1, kv_heads, 32, head_dim), &Device::Cpu)
-                    .unwrap();
-            let v =
-                candle_core::Tensor::from_vec(vdata, (1, kv_heads, 32, head_dim), &Device::Cpu)
-                    .unwrap();
+            let k = candle_core::Tensor::from_vec(kdata, (1, kv_heads, 32, head_dim), &Device::Cpu)
+                .unwrap();
+            let v = candle_core::Tensor::from_vec(vdata, (1, kv_heads, 32, head_dim), &Device::Cpu)
+                .unwrap();
             cache_a.write_kv(layer, &k, &v).unwrap();
         }
         let ids: Vec<u32> = (0..32u32).collect();
