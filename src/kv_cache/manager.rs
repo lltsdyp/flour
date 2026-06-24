@@ -68,7 +68,10 @@ impl KvCacheManager {
                 remote_cache_hit: None,
             };
         };
-        let key = self.key_builder.key_for_tokens(prompt_tokens);
+        let key = self
+            .key_builder
+            .key_for_reusable_prefix(prompt_tokens)
+            .map(|(k, _)| k);
         let remote_cache_hit = match &key {
             Some(k) => Some(match remote.get_object(k) {
                 Ok(Some(_bytes)) => true,
